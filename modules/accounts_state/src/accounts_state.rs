@@ -22,6 +22,8 @@ mod state;
 use state::State;
 mod rest;
 use rest::{handle_drdd, handle_pots, handle_single_account, handle_spdd};
+mod distribution_history;
+use distribution_history::DistributionHistory;
 
 const DEFAULT_SPO_STATE_TOPIC: &str = "cardano.spo.state";
 const DEFAULT_EPOCH_ACTIVITY_TOPIC: &str = "cardano.epoch.activity";
@@ -40,6 +42,8 @@ const DEFAULT_HANDLE_SPDD_TOPIC: (&str, &str) = ("handle-topic-spdd", "rest.get.
 const DEFAULT_HANDLE_POTS_TOPIC: (&str, &str) = ("handle-topic-pots", "rest.get.pots");
 const DEFAULT_HANDLE_DRDD_TOPIC: (&str, &str) = ("handle-topic-drdd", "rest.get.drdd");
 
+const DEFAULT_STORE_HISTORY: (&str, bool) = ("store-history", false);
+
 /// Accounts State module
 #[module(
     message_type(Message),
@@ -52,6 +56,7 @@ impl AccountsState {
     /// Async run loop
     async fn run(
         history: Arc<Mutex<StateHistory<State>>>,
+        distribution_history: Option<Arc<Mutex<DistributionHistory>>>,
         mut drep_publisher: DRepDistributionPublisher,
         mut spo_publisher: SPODistributionPublisher,
         mut spos_subscription: Box<dyn Subscription<Message>>,
@@ -189,6 +194,11 @@ impl AccountsState {
                         state.handle_drep_state(&dreps_msg);
 
                         let drdd = state.generate_drdd();
+
+                        if let Some(dist) = distribution_history.as_ref() {
+                            dist.lock().await.insert_drdd(block_info.epoch, drdd.clone());
+                        }
+
                         if let Err(e) = drep_publisher.publish_drdd(block_info, drdd).await {
                             error!("Error publishing drep voting stake distribution: {e:#}")
                         }
@@ -217,6 +227,11 @@ impl AccountsState {
                             .ok();
 
                         let spdd = state.generate_spdd();
+
+                        if let Some(dist) = distribution_history.as_ref() {
+                            dist.lock().await.insert_spdd(block_info.epoch, spdd.clone());
+                        }
+
                         if let Err(e) = spo_publisher.publish_spdd(block_info, spdd).await {
                             error!("Error publishing SPO stake distribution: {e:#}")
                         }
@@ -283,6 +298,8 @@ impl AccountsState {
     /// Async initialisation
     pub async fn init(&self, context: Arc<Context<Message>>, config: Arc<Config>) -> Result<()> {
         // Get configuration
+        let store_history =
+            config.get_bool(DEFAULT_STORE_HISTORY.0).unwrap_or(DEFAULT_STORE_HISTORY.1);
 
         // Subscription topics
         let spo_state_topic =
@@ -361,6 +378,13 @@ impl AccountsState {
         let history_drdd = history.clone();
         let history_tick = history.clone();
 
+        // Optionally create distribution history based on config flag
+        let distribution_history = if store_history {
+            Some(Arc::new(Mutex::new(DistributionHistory::default())))
+        } else {
+            None
+        };
+
         handle_rest_with_parameter(
             context.clone(),
             &handle_single_account_topic,
@@ -369,16 +393,26 @@ impl AccountsState {
             },
         );
 
-        handle_rest(context.clone(), &handle_spdd_topic, move || {
-            handle_spdd(history_spdd.clone())
+        let distribution_history_spdd = distribution_history.clone();
+        handle_rest(context.clone(), &handle_spdd_topic, move |query| {
+            handle_spdd(
+                history_spdd.clone(),
+                distribution_history_spdd.clone(),
+                query.cloned(),
+            )
         });
 
-        handle_rest(context.clone(), &handle_pots_topic, move || {
+        handle_rest(context.clone(), &handle_pots_topic, move |_query| {
             handle_pots(history_pots.clone())
         });
 
-        handle_rest(context.clone(), &handle_drdd_topic, move || {
-            handle_drdd(history_drdd.clone())
+        let distribution_history_drdd = distribution_history.clone();
+        handle_rest(context.clone(), &handle_drdd_topic, move |query| {
+            handle_drdd(
+                history_drdd.clone(),
+                distribution_history_drdd.clone(),
+                query.cloned(),
+            )
         });
 
         // Ticker to log stats
@@ -416,6 +450,7 @@ impl AccountsState {
         context.run(async move {
             Self::run(
                 history,
+                distribution_history,
                 drep_publisher,
                 spo_publisher,
                 spos_subscription,

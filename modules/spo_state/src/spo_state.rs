@@ -137,7 +137,7 @@ impl SPOState {
 
         // Handle REST requests for full SPO state
         let state_list = state.clone();
-        handle_rest(context.clone(), &handle_list_topic, move || {
+        handle_rest(context.clone(), &handle_list_topic, move |_query| {
             handle_list(state_list.clone())
         });
 

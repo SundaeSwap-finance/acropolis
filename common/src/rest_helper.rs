@@ -4,7 +4,7 @@ use crate::messages::{Message, RESTResponse};
 use anyhow::Result;
 use caryatid_sdk::Context;
 use futures::future::Future;
-use std::sync::Arc;
+use std::{collections::HashMap, sync::Arc};
 use tokio::task::JoinHandle;
 use tracing::{error, info};
 
@@ -15,7 +15,7 @@ pub fn handle_rest<F, Fut>(
     handler: F,
 ) -> JoinHandle<()>
 where
-    F: Fn() -> Fut + Send + Sync + Clone + 'static,
+    F: Fn(Option<&HashMap<String, String>>) -> Fut + Send + Sync + Clone + 'static,
     Fut: Future<Output = Result<RESTResponse>> + Send + 'static,
 {
     context.handle(topic, move |message: Arc<Message>| {
@@ -24,7 +24,12 @@ where
             let response = match message.as_ref() {
                 Message::RESTRequest(request) => {
                     info!("REST received {} {}", request.method, request.path);
-                    match handler().await {
+
+                    let query_params = extract_query_params(&request.path);
+                    info!("REST path elements: {:?}", &request.path_elements);
+                    info!("REST path: {:?}", &request.path);
+
+                    match handler(query_params.as_ref()).await {
                         Ok(response) => response,
                         Err(error) => {
                             RESTResponse::with_text(500, &format!("{error:?}").to_string())
@@ -60,8 +65,7 @@ where
             let response = match message.as_ref() {
                 Message::RESTRequest(request) => {
                     info!("REST received {} {}", request.method, request.path);
-                    let params_vec =
-                        extract_params_from_topic_and_path(&topic_owned, &request.path_elements);
+                    let params_vec = extract_path_params(&topic_owned, &request.path_elements);
                     let params_slice: Vec<&str> = params_vec.iter().map(|s| s.as_str()).collect();
 
                     if params_slice.is_empty() {
@@ -88,7 +92,7 @@ where
 
 /// Extract parameters from the request path based on the topic pattern.
 /// Skips the first 3 parts of the topic as these are never parameters
-fn extract_params_from_topic_and_path(topic: &str, path_elements: &[String]) -> Vec<String> {
+fn extract_path_params(topic: &str, path_elements: &[String]) -> Vec<String> {
     let topic_parts: Vec<&str> = topic.split('.').collect();
 
     // Find indexes of '*' in topic
@@ -105,4 +109,26 @@ fn extract_params_from_topic_and_path(topic: &str, path_elements: &[String]) -> 
         .iter()
         .filter_map(|&pos| pos.checked_sub(offset).and_then(|idx| path_elements.get(idx)).cloned())
         .collect()
+}
+
+/// Extract query parameters
+fn extract_query_params(path: &str) -> Option<HashMap<String, String>> {
+    if let Some((_, query)) = path.split_once('?') {
+        let mut params = HashMap::new();
+        for pair in query.split('&') {
+            if let Some((key, value)) = pair.split_once('=') {
+                params.insert(key.to_string(), value.to_string());
+            } else {
+                params.insert(pair.to_string(), "".to_string());
+            }
+        }
+
+        if params.is_empty() {
+            None
+        } else {
+            Some(params)
+        }
+    } else {
+        None
+    }
 }

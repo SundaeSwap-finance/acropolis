@@ -36,7 +36,7 @@ pub struct StakeAddressState {
     pub delegated_drep: Option<DRepChoice>,
 }
 
-#[derive(Default, Debug, PartialEq, Eq)]
+#[derive(Default, Debug, Clone, PartialEq, Eq)]
 pub struct DRepDelegationDistribution {
     pub abstain: Lovelace,
     pub no_confidence: Lovelace,

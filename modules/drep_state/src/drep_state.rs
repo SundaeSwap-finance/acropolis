@@ -93,7 +93,7 @@ impl DRepState {
         });
 
         let state_list = state.clone();
-        handle_rest(context.clone(), &handle_list_topic, move || {
+        handle_rest(context.clone(), &handle_list_topic, move |_query| {
             let state = state_list.clone();
             async move { Ok(handle_list(state).await) }
         });

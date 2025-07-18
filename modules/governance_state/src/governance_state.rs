@@ -166,7 +166,7 @@ impl GovernanceState {
         });
 
         let state_list = state.clone();
-        handle_rest(context.clone(), &config.handle_topic_list, move || {
+        handle_rest(context.clone(), &config.handle_topic_list, move |_query| {
             handle_list(state_list.clone())
         });
 
