@@ -1,6 +1,6 @@
 //! On-disk store using Sled for immutable UTXOs
 
-use crate::state::{ImmutableUTXOStore, UTXOKey, UTXOValue};
+use crate::state::{ImmutableUTXOStore, UTXOKey, UTxO};
 use anyhow::Result;
 use async_trait::async_trait;
 use config::Config;
@@ -37,7 +37,7 @@ impl SledImmutableUTXOStore {
 #[async_trait]
 impl ImmutableUTXOStore for SledImmutableUTXOStore {
     /// Add a UTXO
-    async fn add_utxo(&self, key: UTXOKey, value: UTXOValue) -> Result<()> {
+    async fn add_utxo(&self, key: UTXOKey, value: UTxO) -> Result<()> {
         let key_bytes = key.to_bytes();
         let value_bytes = serde_cbor::to_vec(&value)?;
         self.db.insert(key_bytes, value_bytes)?;
@@ -52,7 +52,7 @@ impl ImmutableUTXOStore for SledImmutableUTXOStore {
     }
 
     /// Lookup a UTXO
-    async fn lookup_utxo(&self, key: &UTXOKey) -> Result<Option<UTXOValue>> {
+    async fn lookup_utxo(&self, key: &UTXOKey) -> Result<Option<UTxO>> {
         let key_bytes = key.to_bytes();
         Ok(match self.db.get(key_bytes)? {
             Some(ivec) => Some(serde_cbor::from_slice(&ivec)?),

@@ -151,6 +151,9 @@ pub struct TxOutput {
 
     /// Output value (Lovelace)
     pub value: u64,
+
+    /// Multiasset output values
+    pub multiassets: Option<Vec<(Vec<u8>, Vec<u8>, u64)>>,
     // todo: Implement datum    /// Datum (raw)
     // !!!    pub datum: Vec<u8>,
 }

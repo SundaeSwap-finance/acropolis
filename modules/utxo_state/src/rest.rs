@@ -1,8 +1,8 @@
 //! REST handlers for Acropolis UTxO State module
 
-use std::sync::Arc;
+use std::{collections::HashMap, sync::Arc};
 
-use crate::state::{State, UTXOKey};
+use crate::state::{State, UTXOKey, Value};
 use acropolis_common::messages::RESTResponse;
 use anyhow::Result;
 use tokio::sync::Mutex;
@@ -11,7 +11,34 @@ use tokio::sync::Mutex;
 #[derive(serde::Serialize)]
 pub struct UTxOBalanceRest {
     pub address: String,
-    pub value: u64,
+    pub value: UTxOValueRest,
+}
+
+/// REST response structure for value (ADA + multi-assets grouped by policy)
+#[derive(serde::Serialize)]
+pub struct UTxOValueRest {
+    pub coin: u64,
+    pub multiassets: Option<Vec<PolicyAssetsRest>>,
+}
+
+/// REST response structure for multi-assets grouped by policy ID
+#[derive(serde::Serialize)]
+pub struct PolicyAssetsRest {
+    /// Hex-encoded policy ID
+    pub policy_id: String,
+
+    /// List of assets under this policy
+    pub assets: Vec<AssetRest>,
+}
+
+/// REST response structure for a single asset
+#[derive(serde::Serialize)]
+pub struct AssetRest {
+    /// Hex-encoded asset name
+    pub asset_name: String,
+
+    /// Amount of this asset
+    pub amount: u64,
 }
 
 /// Handles /utxos/{tx_hash:index}
@@ -76,7 +103,7 @@ pub async fn handle_single_utxo(
 
             let response = UTxOBalanceRest {
                 address: address_text,
-                value: utxo.value,
+                value: convert_value(&utxo.value),
             };
 
             match serde_json::to_string(&response) {
@@ -91,5 +118,31 @@ pub async fn handle_single_utxo(
             404,
             &format!("UTxO not found. Provided UTxO: {}", param),
         )),
+    }
+}
+
+fn convert_value(value: &Value) -> UTxOValueRest {
+    let multiassets = value.multiassets.as_ref().map(|assets| {
+        let mut grouped: HashMap<String, Vec<AssetRest>> = HashMap::new();
+
+        for (policy, asset, amount) in assets {
+            let policy_id = hex::encode(policy);
+            let asset_name = hex::encode(asset);
+
+            grouped.entry(policy_id).or_default().push(AssetRest {
+                asset_name,
+                amount: *amount,
+            });
+        }
+
+        grouped
+            .into_iter()
+            .map(|(policy_id, assets)| PolicyAssetsRest { policy_id, assets })
+            .collect()
+    });
+
+    UTxOValueRest {
+        coin: value.coin,
+        multiassets,
     }
 }

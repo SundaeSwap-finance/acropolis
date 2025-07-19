@@ -50,14 +50,23 @@ impl Hash for UTXOKey {
     }
 }
 
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct Value {
+    /// Lovelace amount
+    pub coin: u64,
+
+    /// Multi-asset list
+    pub multiassets: Option<Vec<(Vec<u8>, Vec<u8>, u64)>>,
+}
+
 /// Value stored in UTXO
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub struct UTXOValue {
+pub struct UTxO {
     /// Address in binary
     pub address: Address,
 
-    /// Value in Lovelace
-    pub value: u64,
+    /// Full value (ADA + multiassets)
+    pub value: Value,
 }
 
 /// Address delta observer
@@ -80,13 +89,13 @@ pub trait AddressDeltaObserver: Send + Sync {
 #[async_trait]
 pub trait ImmutableUTXOStore: Send + Sync {
     /// Add a UTXO
-    async fn add_utxo(&self, key: UTXOKey, value: UTXOValue) -> Result<()>;
+    async fn add_utxo(&self, key: UTXOKey, value: UTxO) -> Result<()>;
 
     /// Delete a UTXO
     async fn delete_utxo(&self, key: &UTXOKey) -> Result<()>;
 
     /// Lookup a UTXO
-    async fn lookup_utxo(&self, key: &UTXOKey) -> Result<Option<UTXOValue>>;
+    async fn lookup_utxo(&self, key: &UTXOKey) -> Result<Option<UTxO>>;
 
     /// Get the number of UTXOs in the store
     async fn len(&self) -> Result<usize>;
@@ -101,7 +110,7 @@ pub struct State {
     last_number: u64,
 
     /// Volatile UTXOs
-    volatile_utxos: HashMap<UTXOKey, UTXOValue>,
+    volatile_utxos: HashMap<UTXOKey, UTxO>,
 
     /// Index of volatile UTXOs by created block
     volatile_created: VolatileIndex,
@@ -136,7 +145,7 @@ impl State {
     }
 
     /// Look up a UTXO
-    pub async fn lookup_utxo(&self, key: &UTXOKey) -> Result<Option<UTXOValue>> {
+    pub async fn lookup_utxo(&self, key: &UTXOKey) -> Result<Option<UTxO>> {
         match self.volatile_utxos.get(key) {
             Some(key) => Ok(Some(key.clone())),
             None => Ok(self.immutable_utxos.lookup_utxo(key).await?),
@@ -166,7 +175,7 @@ impl State {
                     if let Some(utxo) = self.volatile_utxos.remove(&key) {
                         // Tell the observer to debit it
                         if let Some(observer) = self.address_delta_observer.as_ref() {
-                            observer.observe_delta(&utxo.address, -(utxo.value as i64)).await;
+                            observer.observe_delta(&utxo.address, -(utxo.value.coin as i64)).await;
                         }
                     }
                 }
@@ -178,7 +187,7 @@ impl State {
                     if let Some(utxo) = self.volatile_utxos.get(&key) {
                         // Tell the observer to recredit it
                         if let Some(observer) = self.address_delta_observer.as_ref() {
-                            observer.observe_delta(&utxo.address, utxo.value as i64).await;
+                            observer.observe_delta(&utxo.address, utxo.value.coin as i64).await;
                         }
                     }
                 }
@@ -218,12 +227,15 @@ impl State {
         match self.lookup_utxo(&key).await? {
             Some(utxo) => {
                 if tracing::enabled!(tracing::Level::DEBUG) {
-                    debug!("        - spent {} from {:?}", utxo.value, utxo.address);
+                    debug!(
+                        "        - spent {} from {:?}",
+                        utxo.value.coin, utxo.address
+                    );
                 }
 
                 // Tell the observer it's spent
                 if let Some(observer) = self.address_delta_observer.as_ref() {
-                    observer.observe_delta(&utxo.address, -(utxo.value as i64)).await;
+                    observer.observe_delta(&utxo.address, -(utxo.value.coin as i64)).await;
                 }
 
                 match block.status {
@@ -260,9 +272,12 @@ impl State {
         // Insert the UTXO, checking if it already existed
         let key = UTXOKey::new(&output.tx_hash, output.index);
 
-        let value = UTXOValue {
+        let value = UTxO {
             address: output.address.clone(),
-            value: output.value,
+            value: Value {
+                coin: output.value,
+                multiassets: output.multiassets.clone(),
+            },
         };
 
         // Add to volatile or immutable maps
@@ -442,6 +457,7 @@ mod tests {
             index: 0,
             address: create_address(99),
             value: 42,
+            multiassets: None,
         };
 
         let block = create_block(BlockStatus::Immutable, 1, 1);
@@ -456,7 +472,7 @@ mod tests {
                     matches!(&value.address, Address::Byron(ByronAddress{ payload })
                     if payload[0] == 99)
                 );
-                assert_eq!(42, value.value);
+                assert_eq!(42, value.value.coin);
             }
 
             _ => panic!("UTXO not found"),
@@ -471,6 +487,7 @@ mod tests {
             index: 0,
             address: create_address(99),
             value: 42,
+            multiassets: None,
         };
 
         let block1 = create_block(BlockStatus::Immutable, 1, 1);
@@ -497,6 +514,7 @@ mod tests {
             index: 0,
             address: create_address(99),
             value: 42,
+            multiassets: None,
         };
 
         let block10 = create_block(BlockStatus::Volatile, 10, 10);
@@ -522,6 +540,7 @@ mod tests {
             index: 0,
             address: create_address(99),
             value: 42,
+            multiassets: None,
         };
 
         let block10 = create_block(BlockStatus::Volatile, 10, 10);
@@ -559,6 +578,7 @@ mod tests {
             index: 0,
             address: create_address(99),
             value: 42,
+            multiassets: None,
         };
 
         let block1 = create_block(BlockStatus::Volatile, 1, 1);
@@ -591,6 +611,7 @@ mod tests {
             index: 0,
             address: create_address(99),
             value: 42,
+            multiassets: None,
         };
 
         let block1 = create_block(BlockStatus::Volatile, 1, 1);
@@ -662,6 +683,7 @@ mod tests {
             index: 0,
             address: create_address(99),
             value: 42,
+            multiassets: None,
         };
 
         let block1 = create_block(BlockStatus::Immutable, 1, 1);
@@ -693,6 +715,7 @@ mod tests {
             index: 0,
             address: create_address(99),
             value: 42,
+            multiassets: None,
         };
 
         let block10 = create_block(BlockStatus::Volatile, 10, 10);
@@ -722,6 +745,7 @@ mod tests {
             index: 0,
             address: create_address(99),
             value: 42,
+            multiassets: None,
         };
 
         let block10 = create_block(BlockStatus::Volatile, 10, 10);

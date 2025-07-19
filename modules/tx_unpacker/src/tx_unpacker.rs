@@ -2,11 +2,11 @@
 //! Unpacks transaction bodies into UTXO events
 
 use acropolis_common::{
-    rational_number::RationalNumber,
     messages::{
         BlockFeesMessage, CardanoMessage, GovernanceProceduresMessage, Message,
         TxCertificatesMessage, UTXODeltasMessage, WithdrawalsMessage,
     },
+    rational_number::RationalNumber,
     *,
 };
 use caryatid_sdk::{module, Context, Module};
@@ -16,15 +16,13 @@ use std::{collections::HashMap, sync::Arc};
 use anyhow::{anyhow, Result};
 use config::Config;
 use futures::future::join_all;
-use pallas::{
-    ledger::*,
-    ledger::{
-        primitives::{
-            alonzo, conway, Nullable, Relay as PallasRelay, ScriptHash,
-            StakeCredential as PallasStakeCredential,
-        },
-        traverse::{MultiEraCert, MultiEraTx},
+use pallas::ledger::{
+    primitives::{
+        alonzo, conway, Nullable, Relay as PallasRelay, ScriptHash,
+        StakeCredential as PallasStakeCredential,
     },
+    traverse::{MultiEraCert, MultiEraPolicyAssets, MultiEraTx},
+    *,
 };
 use tracing::{debug, error, info};
 
@@ -804,7 +802,7 @@ impl TxUnpacker {
                                                                 index: index as u64,
                                                                 address: address,
                                                                 value: output.value().coin(),
-                                                                // !!! datum
+                                                                multiassets: extract_output_assets(&output.value().assets())
                                                             };
 
                                                             deltas.push(UTXODelta::Output(tx_output));
@@ -957,5 +955,30 @@ impl TxUnpacker {
         });
 
         Ok(())
+    }
+}
+
+pub fn extract_output_assets<'b>(
+    assets: &[MultiEraPolicyAssets<'b>],
+) -> Option<Vec<(Vec<u8>, Vec<u8>, u64)>> {
+    let flattened = assets
+        .iter()
+        .flat_map(|pa| match pa {
+            MultiEraPolicyAssets::AlonzoCompatibleOutput(policy, kvps) => kvps
+                .iter()
+                .map(move |(asset, amount)| (policy.to_vec(), asset.to_vec(), *amount))
+                .collect::<Vec<_>>(),
+            MultiEraPolicyAssets::ConwayOutput(policy, kvps) => kvps
+                .iter()
+                .map(move |(asset, amount)| (policy.to_vec(), asset.to_vec(), (*amount).into()))
+                .collect::<Vec<_>>(),
+            _ => Vec::new(),
+        })
+        .collect::<Vec<_>>();
+
+    if flattened.is_empty() {
+        None
+    } else {
+        Some(flattened)
     }
 }

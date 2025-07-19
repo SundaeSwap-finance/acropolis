@@ -65,9 +65,8 @@ impl GenesisBootstrapper {
                 .unwrap_or(DEFAULT_COMPLETION_TOPIC.to_string());
             info!("Completing with '{completion_topic}'");
 
-            let network_name = config
-                .get_string("network-name")
-                .unwrap_or(DEFAULT_NETWORK_NAME.to_string());
+            let network_name =
+                config.get_string("network-name").unwrap_or(DEFAULT_NETWORK_NAME.to_string());
 
             let genesis = match network_name.as_ref() {
                 "mainnet" => MAINNET_BYRON_GENESIS,
@@ -80,8 +79,8 @@ impl GenesisBootstrapper {
             info!("Reading genesis for '{network_name}'");
 
             // Read genesis data
-            let genesis: byron::GenesisFile = serde_json::from_slice(genesis)
-                .expect("Invalid JSON in BYRON_GENESIS file");
+            let genesis: byron::GenesisFile =
+                serde_json::from_slice(genesis).expect("Invalid JSON in BYRON_GENESIS file");
 
             // Construct messages
             let block_info = BlockInfo {
@@ -107,6 +106,7 @@ impl GenesisBootstrapper {
                         payload: address.payload.to_vec(),
                     }),
                     value: *amount,
+                    multiassets: None,
                 };
 
                 utxo_deltas_message.deltas.push(UTXODelta::Output(tx_output));

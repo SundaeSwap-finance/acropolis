@@ -1,6 +1,6 @@
 //! On-disk store using Fjall for immutable UTXOs
 
-use crate::state::{ImmutableUTXOStore, UTXOKey, UTXOValue};
+use crate::state::{ImmutableUTXOStore, UTXOKey, UTxO};
 use anyhow::Result;
 use async_trait::async_trait;
 use config::Config;
@@ -64,7 +64,7 @@ impl FjallAsyncImmutableUTXOStore {
 
 #[async_trait]
 impl ImmutableUTXOStore for FjallAsyncImmutableUTXOStore {
-    async fn add_utxo(&self, key: UTXOKey, value: UTXOValue) -> Result<()> {
+    async fn add_utxo(&self, key: UTXOKey, value: UTxO) -> Result<()> {
         let partition = self.partition.clone();
         let keyspace = self.keyspace.clone();
         let key_bytes = key.to_bytes();
@@ -101,7 +101,7 @@ impl ImmutableUTXOStore for FjallAsyncImmutableUTXOStore {
         Ok(())
     }
 
-    async fn lookup_utxo(&self, key: &UTXOKey) -> Result<Option<UTXOValue>> {
+    async fn lookup_utxo(&self, key: &UTXOKey) -> Result<Option<UTxO>> {
         let partition = self.partition.clone();
         let key_bytes = key.to_bytes();
 

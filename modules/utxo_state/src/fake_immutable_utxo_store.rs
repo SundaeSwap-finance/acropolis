@@ -1,6 +1,6 @@
 //! Fake store for immutable UTXOs
 
-use crate::state::{ImmutableUTXOStore, UTXOKey, UTXOValue};
+use crate::state::{ImmutableUTXOStore, UTXOKey, UTxO, Value};
 use acropolis_common::Address;
 use anyhow::Result;
 use async_trait::async_trait;
@@ -30,7 +30,7 @@ impl FakeImmutableUTXOStore {
 #[async_trait]
 impl ImmutableUTXOStore for FakeImmutableUTXOStore {
     /// Add a UTXO
-    async fn add_utxo(&self, _key: UTXOKey, _value: UTXOValue) -> Result<()> {
+    async fn add_utxo(&self, _key: UTXOKey, _value: UTxO) -> Result<()> {
         if self.delay_us != 0 {
             sleep(Duration::from_micros(self.delay_us)).await;
         }
@@ -48,10 +48,13 @@ impl ImmutableUTXOStore for FakeImmutableUTXOStore {
     }
 
     /// Lookup a UTXO
-    async fn lookup_utxo(&self, _key: &UTXOKey) -> Result<Option<UTXOValue>> {
-        Ok(Some(UTXOValue {
+    async fn lookup_utxo(&self, _key: &UTXOKey) -> Result<Option<UTxO>> {
+        Ok(Some(UTxO {
             address: Address::None,
-            value: 42,
+            value: Value {
+                coin: 0,
+                multiassets: None,
+            },
         }))
     }
 

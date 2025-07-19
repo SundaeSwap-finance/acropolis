@@ -1,6 +1,6 @@
 //! On-disk store using Fjall for immutable UTXOs
 
-use crate::state::{ImmutableUTXOStore, UTXOKey, UTXOValue};
+use crate::state::{ImmutableUTXOStore, UTXOKey, UTxO};
 use anyhow::Result;
 use async_trait::async_trait;
 use config::Config;
@@ -62,7 +62,7 @@ impl FjallImmutableUTXOStore {
 
 #[async_trait]
 impl ImmutableUTXOStore for FjallImmutableUTXOStore {
-    async fn add_utxo(&self, key: UTXOKey, value: UTXOValue) -> Result<()> {
+    async fn add_utxo(&self, key: UTXOKey, value: UTxO) -> Result<()> {
         let key_bytes = key.to_bytes();
         let value_bytes = serde_cbor::to_vec(&value)?;
         let should_flush = self.should_flush();
@@ -86,7 +86,7 @@ impl ImmutableUTXOStore for FjallImmutableUTXOStore {
         Ok(())
     }
 
-    async fn lookup_utxo(&self, key: &UTXOKey) -> Result<Option<UTXOValue>> {
+    async fn lookup_utxo(&self, key: &UTXOKey) -> Result<Option<UTxO>> {
         let key_bytes = key.to_bytes();
         Ok(match self.partition.get(key_bytes)? {
             Some(ivec) => Some(serde_cbor::from_slice(&ivec)?),
