@@ -47,6 +47,11 @@ pub struct DRepsList {
 pub struct DRepInfo {
     pub deposit: Lovelace,
     pub anchor: Option<Anchor>,
+    // Optional storage fields for rest_blockfrost
+    pub retired: Option<bool>,
+    pub expired: Option<bool>,
+    pub active_epoch: Option<u64>,
+    pub last_active_epoch: Option<u64>,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]

@@ -2,13 +2,13 @@
 use acropolis_common::{
     messages::{Message, RESTResponse, StateQuery, StateQueryResponse},
     queries::governance::{GovernanceStateQuery, GovernanceStateQueryResponse},
-    Credential, GovActionId,
+    Credential, GovActionId, Voter,
 };
 use anyhow::Result;
 use caryatid_sdk::Context;
-use std::{collections::BTreeMap, sync::Arc};
+use std::sync::Arc;
 
-use crate::types::VoteRest;
+use crate::types::{DRepInfoREST, DRepsListREST, ProposalVoteREST, VoterRoleREST};
 
 pub async fn handle_dreps_list_blockfrost(
     context: Arc<Context<Message>>,
@@ -23,12 +23,20 @@ pub async fn handle_dreps_list_blockfrost(
         Message::StateQueryResponse(StateQueryResponse::Governance(
             GovernanceStateQueryResponse::DRepsList(list),
         )) => {
-            let dreps: Vec<String> =
-                list.dreps.iter().map(|cred| cred.to_drep_bech32()).collect::<Result<_, _>>()?;
+            let response: Vec<DRepsListREST> = list
+                .dreps
+                .iter()
+                .map(|cred| {
+                    Ok(DRepsListREST {
+                        drep_id: cred.to_drep_bech32()?,
+                        hex: hex::encode(cred.get_hash()),
+                    })
+                })
+                .collect::<Result<_, anyhow::Error>>()?;
 
             Ok(RESTResponse::with_json(
                 200,
-                &serde_json::to_string(&dreps)?,
+                &serde_json::to_string(&response)?,
             ))
         }
 
@@ -64,7 +72,7 @@ pub async fn handle_single_drep_blockfrost(
 
     let msg = Arc::new(Message::StateQuery(StateQuery::Governance(
         GovernanceStateQuery::GetDRepInfo {
-            drep_credential: credential,
+            drep_credential: credential.clone(),
         },
     )));
 
@@ -74,13 +82,42 @@ pub async fn handle_single_drep_blockfrost(
     match message {
         Message::StateQueryResponse(StateQueryResponse::Governance(
             GovernanceStateQueryResponse::DRepInfo(info),
-        )) => match serde_json::to_string(&info) {
-            Ok(json) => Ok(RESTResponse::with_json(200, &json)),
-            Err(e) => Ok(RESTResponse::with_text(
-                500,
-                &format!("Failed to serialize DRep info: {e}"),
-            )),
-        },
+        )) => {
+            let drep_id = credential.to_drep_bech32().unwrap_or_else(|_| "<invalid>".to_string());
+            let hex = hex::encode(credential.get_hash());
+            let has_script = matches!(credential, Credential::ScriptHash(_));
+
+            if let (Some(retired), Some(expired), Some(active_epoch), Some(last_active_epoch)) = (
+                info.retired,
+                info.expired,
+                info.active_epoch,
+                info.last_active_epoch,
+            ) {
+                let active = !retired && !expired;
+
+                let rest_info = DRepInfoREST {
+                    drep_id,
+                    hex,
+                    amount: info.deposit.to_string(),
+                    active,
+                    active_epoch,
+                    has_script,
+                    last_active_epoch,
+                    retired,
+                    expired,
+                };
+
+                match serde_json::to_string(&rest_info) {
+                    Ok(json) => Ok(RESTResponse::with_json(200, &json)),
+                    Err(e) => Ok(RESTResponse::with_text(
+                        500,
+                        &format!("Failed to serialize DRep info: {e}"),
+                    )),
+                }
+            } else {
+                Ok(RESTResponse::with_text(501, "DRep REST endpoints disabled"))
+            }
+        }
 
         Message::StateQueryResponse(StateQueryResponse::Governance(
             GovernanceStateQueryResponse::NotFound,
@@ -232,6 +269,9 @@ pub async fn handle_proposal_votes_blockfrost(
         Err(resp) => return Ok(resp),
     };
 
+    let tx_hash = hex::encode(&proposal.transaction_id);
+    let cert_index = proposal.action_index;
+
     let msg = Arc::new(Message::StateQuery(StateQuery::Governance(
         GovernanceStateQuery::GetProposalVotes { proposal },
     )));
@@ -243,22 +283,30 @@ pub async fn handle_proposal_votes_blockfrost(
         Message::StateQueryResponse(StateQueryResponse::Governance(
             GovernanceStateQueryResponse::ProposalVotes(votes),
         )) => {
-            let mut votes_map = BTreeMap::new();
+            let mut votes_list = Vec::new();
 
-            for (voter, (data_hash, voting_proc)) in votes.votes {
-                let voter_bech32 = voter.to_string();
-                let transaction_hex = hex::encode(data_hash);
+            for (voter, (_, voting_proc)) in votes.votes {
+                let voter_role = match voter {
+                    Voter::ConstitutionalCommitteeKey(_)
+                    | Voter::ConstitutionalCommitteeScript(_) => {
+                        VoterRoleREST::Constitutional_Committee
+                    }
+                    Voter::DRepKey(_) | Voter::DRepScript(_) => VoterRoleREST::DRep,
+                    Voter::StakePoolKey(_) => VoterRoleREST::SPO,
+                };
 
-                votes_map.insert(
-                    voter_bech32,
-                    VoteRest {
-                        transaction: transaction_hex,
-                        voting_procedure: voting_proc,
-                    },
-                );
+                let voter_str = voter.to_string();
+
+                votes_list.push(ProposalVoteREST {
+                    tx_hash: tx_hash.clone(),
+                    cert_index,
+                    voter_role,
+                    voter: voter_str,
+                    vote: voting_proc.vote,
+                });
             }
 
-            match serde_json::to_string(&votes_map) {
+            match serde_json::to_string(&votes_list) {
                 Ok(json) => Ok(RESTResponse::with_json(200, &json)),
                 Err(e) => Ok(RESTResponse::with_text(
                     500,

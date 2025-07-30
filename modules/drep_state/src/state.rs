@@ -6,13 +6,36 @@ use acropolis_common::{
 use anyhow::{anyhow, Result};
 use serde_with::serde_as;
 use std::collections::HashMap;
-use tracing::info;
+use tracing::{error, info};
 
 #[serde_as]
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct DRepRecord {
     pub deposit: Lovelace,
     pub anchor: Option<Anchor>,
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+pub struct HistoricalDRepRecord {
+    pub deposit: Lovelace,
+    pub anchor: Option<Anchor>,
+    pub expired: Option<bool>,
+    pub active_epoch: Option<u64>,
+    pub last_active_epoch: Option<u64>,
+    pub updates: Vec<DRepUpdateEvent>,
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+pub struct DRepUpdateEvent {
+    pub tx_hash: String,
+    pub cert_index: u64,
+    pub action: DRepActionUpdate,
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+pub enum DRepActionUpdate {
+    Registered,
+    Deregistered,
 }
 
 impl DRepRecord {
@@ -23,12 +46,18 @@ impl DRepRecord {
 
 pub struct State {
     dreps: HashMap<DRepCredential, DRepRecord>,
+    historical_dreps: Option<HashMap<DRepCredential, HistoricalDRepRecord>>,
 }
 
 impl State {
-    pub fn new() -> Self {
+    pub fn new(store_history: bool) -> Self {
         Self {
             dreps: HashMap::new(),
+            historical_dreps: if store_history {
+                Some(HashMap::new())
+            } else {
+                None
+            },
         }
     }
 
@@ -37,8 +66,16 @@ impl State {
         self.dreps.len()
     }
 
+    #[allow(dead_code)]
     pub fn get_drep(&self, credential: &DRepCredential) -> Option<&DRepRecord> {
         self.dreps.get(credential)
+    }
+
+    pub fn get_historical_drep(
+        &self,
+        credential: &DRepCredential,
+    ) -> Option<&HistoricalDRepRecord> {
+        self.historical_dreps.as_ref().and_then(|map| map.get(credential))
     }
 
     pub fn list(&self) -> Vec<DRepCredential> {
@@ -101,6 +138,56 @@ impl State {
         }
     }
 
+    fn process_one_certificate_historical(
+        tx_cert: &TxCertificate,
+        historical: &mut HashMap<DRepCredential, HistoricalDRepRecord>,
+    ) -> Result<()> {
+        match tx_cert {
+            TxCertificate::DRepRegistration(reg) => {
+                let entry = historical.entry(reg.credential.clone()).or_insert_with(|| {
+                    HistoricalDRepRecord {
+                        deposit: reg.deposit,
+                        anchor: reg.anchor.clone(),
+                        expired: Some(false),
+                        active_epoch: reg.epoch,
+                        last_active_epoch: None,
+                        updates: Vec::new(),
+                    }
+                });
+
+                entry.deposit = reg.deposit;
+                entry.anchor = reg.anchor.clone();
+                entry.expired = Some(false);
+
+                entry.updates.push(DRepUpdateEvent {
+                    tx_hash: reg.tx_hash.clone(),
+                    cert_index: reg.cert_index as u64,
+                    action: DRepActionUpdate::Registered,
+                });
+            }
+            TxCertificate::DRepDeregistration(reg) => {
+                if let Some(existing) = historical.get_mut(&reg.credential) {
+                    existing.updates.push(DRepUpdateEvent {
+                        tx_hash: reg.tx_hash,
+                        cert_index: reg.cert_index,
+                        action: DRepActionUpdate::Deregistered,
+                    });
+                } else {
+                    tracing::error!("Deregistration certificate for {:?} without corresponding registration record.", reg.credential.to_drep_bech32())
+                }
+            }
+            TxCertificate::DRepUpdate(reg) => {
+                if let Some(existing) = historical.get_mut(&reg.credential) {
+                    existing.anchor = reg.anchor.clone();
+                    // optionally update timestamps
+                }
+            }
+            _ => {}
+        }
+
+        Ok(())
+    }
+
     pub fn active_drep_list(&self) -> Vec<(DRepCredential, Lovelace)> {
         let mut distribution = Vec::new();
         for (drep, drep_info) in self.dreps.iter() {
@@ -113,6 +200,15 @@ impl State {
         for tx_cert in tx_cert_msg.certificates.iter() {
             if let Err(e) = self.process_one_certificate(tx_cert) {
                 tracing::error!("Error processing tx_cert {}", e);
+            }
+        }
+
+        // Optional second pass: update historical tracking
+        if let Some(historical) = self.historical_dreps.as_mut() {
+            for tx_cert in tx_cert_msg.certificates.iter() {
+                if let Err(e) = Self::process_one_certificate_historical(tx_cert, historical) {
+                    tracing::error!("Error processing historical cert: {}", e);
+                }
             }
         }
 
@@ -144,7 +240,7 @@ mod tests {
             deposit: 500000000,
             anchor: None,
         });
-        let mut state = State::new();
+        let mut state = State::new(false);
         assert_eq!(state.process_one_certificate(&tx_cert).unwrap(), true);
         assert_eq!(state.get_count(), 1);
         let tx_cert_record = DRepRecord {
@@ -165,7 +261,7 @@ mod tests {
             deposit: 500000000,
             anchor: None,
         });
-        let mut state = State::new();
+        let mut state = State::new(false);
         assert_eq!(state.process_one_certificate(&tx_cert).unwrap(), true);
 
         let bad_tx_cert = TxCertificate::DRepRegistration(DRepRegistration {
@@ -194,7 +290,7 @@ mod tests {
             deposit: 500000000,
             anchor: None,
         });
-        let mut state = State::new();
+        let mut state = State::new(false);
         assert_eq!(state.process_one_certificate(&tx_cert).unwrap(), true);
 
         let anchor = Anchor {
@@ -230,7 +326,7 @@ mod tests {
             deposit: 500000000,
             anchor: None,
         });
-        let mut state = State::new();
+        let mut state = State::new(false);
         assert_eq!(state.process_one_certificate(&tx_cert).unwrap(), true);
 
         let anchor = Anchor {
@@ -263,7 +359,7 @@ mod tests {
             deposit: 500000000,
             anchor: None,
         });
-        let mut state = State::new();
+        let mut state = State::new(false);
         assert_eq!(state.process_one_certificate(&tx_cert).unwrap(), true);
 
         let unregister_tx_cert = TxCertificate::DRepDeregistration(DRepDeregistration {
@@ -286,7 +382,7 @@ mod tests {
             deposit: 500000000,
             anchor: None,
         });
-        let mut state = State::new();
+        let mut state = State::new(false);
         assert_eq!(state.process_one_certificate(&tx_cert).unwrap(), true);
 
         let unregister_tx_cert = TxCertificate::DRepDeregistration(DRepDeregistration {

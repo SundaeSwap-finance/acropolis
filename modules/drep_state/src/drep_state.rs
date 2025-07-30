@@ -17,8 +17,11 @@ use tracing::{error, info, info_span, Instrument};
 mod state;
 use state::State;
 
+use crate::state::DRepActionUpdate;
+
 const DEFAULT_SUBSCRIBE_TOPIC: &str = "cardano.certificates";
 const DEFAULT_DREP_STATE_TOPIC: &str = "cardano.drep.state";
+const DEFAULT_STORE_HISTORY: (&str, bool) = ("store-history", false);
 
 /// DRep State module
 #[module(
@@ -40,7 +43,10 @@ impl DRepState {
             .unwrap_or(DEFAULT_DREP_STATE_TOPIC.to_string());
         info!("Creating DRep state publisher on '{drep_state_topic}'");
 
-        let state = Arc::new(Mutex::new(State::new()));
+        let store_history =
+            config.get_bool(DEFAULT_STORE_HISTORY.0).unwrap_or(DEFAULT_STORE_HISTORY.1);
+
+        let state = Arc::new(Mutex::new(State::new(store_history)));
 
         // Subscribe for certificate messages
         let state1 = state.clone();
@@ -77,7 +83,9 @@ impl DRepState {
                                     .await
                                     .unwrap_or_else(|e| error!("Failed to publish: {e}"));
                             }
-                        }.instrument(span).await;
+                        }
+                        .instrument(span)
+                        .await;
                     }
 
                     _ => error!("Unexpected message type: {message:?}"),
@@ -87,7 +95,7 @@ impl DRepState {
 
         let query_state = state.clone();
         context.handle("drep-state", move |message| {
-            let state_handle = query_state.clone(); // your shared Arc<Mutex<State>>
+            let state_handle = query_state.clone();
             async move {
                 let Message::StateQuery(StateQuery::Governance(query)) = message.as_ref() else {
                     return Arc::new(Message::StateQueryResponse(StateQueryResponse::Governance(
@@ -105,11 +113,21 @@ impl DRepState {
                         GovernanceStateQueryResponse::DRepsList(DRepsList { dreps })
                     }
                     GovernanceStateQuery::GetDRepInfo { drep_credential } => {
-                        match locked.get_drep(&drep_credential) {
-                            Some(record) => GovernanceStateQueryResponse::DRepInfo(DRepInfo {
-                                deposit: record.deposit,
-                                anchor: record.anchor.clone(),
-                            }),
+                        match locked.get_historical_drep(&drep_credential) {
+                            Some(record) => {
+                                let retired = matches!(
+                                    record.updates.last().map(|u| u.action),
+                                    Some(DRepActionUpdate::Deregistered)
+                                );
+                                GovernanceStateQueryResponse::DRepInfo(DRepInfo {
+                                    deposit: record.deposit,
+                                    anchor: record.anchor.clone(),
+                                    retired: Some(retired),
+                                    expired: record.expired,
+                                    active_epoch: record.active_epoch,
+                                    last_active_epoch: record.last_active_epoch,
+                                })
+                            }
                             None => GovernanceStateQueryResponse::NotFound,
                         }
                     }
@@ -143,7 +161,9 @@ impl DRepState {
                                 .await
                                 .inspect_err(|e| error!("Tick error: {e}"))
                                 .ok();
-                        }.instrument(span).await;
+                        }
+                        .instrument(span)
+                        .await;
                     }
                 }
             }

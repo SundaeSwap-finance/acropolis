@@ -33,6 +33,7 @@ address-delta-topic = "cardano.address.delta"
 [module.spo-state]
 
 [module.drep-state]
+store-history = true
 
 [module.governance-state]
 
