@@ -17,11 +17,16 @@ use tracing::{error, info, info_span, Instrument};
 mod state;
 use state::State;
 
-use crate::state::DRepActionUpdate;
+use crate::state::DRepStorageConfig;
 
-const DEFAULT_SUBSCRIBE_TOPIC: &str = "cardano.certificates";
-const DEFAULT_DREP_STATE_TOPIC: &str = "cardano.drep.state";
-const DEFAULT_STORE_HISTORY: (&str, bool) = ("store-history", false);
+const DEFAULT_SUBSCRIBE_TOPIC: (&str, &str) = ("subscribe-topic", "cardano.certificates");
+const DEFAULT_DREP_STATE_TOPIC: (&str, &str) = ("publish-drep-state-topic", "cardano.drep.state");
+
+const DEFAULT_STORE_INFO: (&str, bool) = ("store-info", false);
+const DEFAULT_STORE_DELEGATORS: (&str, bool) = ("store-delegators", false);
+const DEFAULT_STORE_METADATA: (&str, bool) = ("store-metadata", false);
+const DEFAULT_STORE_UPDATES: (&str, bool) = ("store-updates", false);
+const DEFAULT_STORE_VOTES: (&str, bool) = ("store-votes", false);
 
 /// DRep State module
 #[module(
@@ -29,24 +34,35 @@ const DEFAULT_STORE_HISTORY: (&str, bool) = ("store-history", false);
     name = "drep-state",
     description = "In-memory DRep State from certificate events"
 )]
+
 pub struct DRepState;
 
 impl DRepState {
     pub async fn init(&self, context: Arc<Context<Message>>, config: Arc<Config>) -> Result<()> {
+        fn get_flag(config: &Config, key: (&str, bool)) -> bool {
+            config.get_bool(key.0).unwrap_or(key.1)
+        }
+
+        fn get_string(config: &Config, key: (&str, &str)) -> String {
+            config.get_string(key.0).unwrap_or_else(|_| key.1.to_string())
+        }
+
         // Get configuration
-        let subscribe_topic =
-            config.get_string("subscribe-topic").unwrap_or(DEFAULT_SUBSCRIBE_TOPIC.to_string());
+        let subscribe_topic = get_string(&config, DEFAULT_SUBSCRIBE_TOPIC);
         info!("Creating subscriber on '{subscribe_topic}'");
 
-        let drep_state_topic = config
-            .get_string("publish-drep-state-topic")
-            .unwrap_or(DEFAULT_DREP_STATE_TOPIC.to_string());
+        let drep_state_topic = get_string(&config, DEFAULT_DREP_STATE_TOPIC);
         info!("Creating DRep state publisher on '{drep_state_topic}'");
 
-        let store_history =
-            config.get_bool(DEFAULT_STORE_HISTORY.0).unwrap_or(DEFAULT_STORE_HISTORY.1);
+        let storage_config = DRepStorageConfig {
+            store_info: get_flag(&config, DEFAULT_STORE_INFO),
+            store_delegators: get_flag(&config, DEFAULT_STORE_DELEGATORS),
+            store_metadata: get_flag(&config, DEFAULT_STORE_METADATA),
+            store_updates: get_flag(&config, DEFAULT_STORE_UPDATES),
+            store_votes: get_flag(&config, DEFAULT_STORE_VOTES),
+        };
 
-        let state = Arc::new(Mutex::new(State::new(store_history)));
+        let state = Arc::new(Mutex::new(State::new(storage_config)));
 
         // Subscribe for certificate messages
         let state1 = state.clone();
@@ -114,20 +130,18 @@ impl DRepState {
                     }
                     GovernanceStateQuery::GetDRepInfo { drep_credential } => {
                         match locked.get_historical_drep(&drep_credential) {
-                            Some(record) => {
-                                let retired = matches!(
-                                    record.updates.last().map(|u| u.action),
-                                    Some(DRepActionUpdate::Deregistered)
-                                );
-                                GovernanceStateQueryResponse::DRepInfo(DRepInfo {
-                                    deposit: record.deposit,
-                                    anchor: record.anchor.clone(),
-                                    retired: Some(retired),
-                                    expired: record.expired,
-                                    active_epoch: record.active_epoch,
-                                    last_active_epoch: record.last_active_epoch,
-                                })
-                            }
+                            Some(record) => match &record.info {
+                                Some(info) => GovernanceStateQueryResponse::DRepInfo(DRepInfo {
+                                    deposit: info.deposit,
+                                    retired: info.retired,
+                                    expired: info.expired,
+                                    active_epoch: info.active_epoch,
+                                    last_active_epoch: info.last_active_epoch,
+                                }),
+                                None => GovernanceStateQueryResponse::Error(
+                                    "DRep info storage is disabled by configuration.".to_string(),
+                                ),
+                            },
                             None => GovernanceStateQueryResponse::NotFound,
                         }
                     }
@@ -135,7 +149,6 @@ impl DRepState {
                         "Unimplemented governance query: {query:?}"
                     )),
                 };
-
                 Arc::new(Message::StateQueryResponse(StateQueryResponse::Governance(
                     response,
                 )))

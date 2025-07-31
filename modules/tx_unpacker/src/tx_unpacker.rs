@@ -2,11 +2,11 @@
 //! Unpacks transaction bodies into UTXO events
 
 use acropolis_common::{
-    rational_number::RationalNumber,
     messages::{
         BlockFeesMessage, CardanoMessage, GovernanceProceduresMessage, Message,
         TxCertificatesMessage, UTXODeltasMessage, WithdrawalsMessage,
     },
+    rational_number::RationalNumber,
     *,
 };
 use caryatid_sdk::{module, Context, Module};
@@ -220,7 +220,9 @@ impl TxUnpacker {
     fn map_certificate(
         cert: &MultiEraCert,
         tx_index: usize,
+        tx_hash: [u8; 32],
         cert_index: usize,
+        epoch: u64,
     ) -> Result<TxCertificate> {
         match cert {
             MultiEraCert::NotApplicable => Err(anyhow!("Not applicable cert!")),
@@ -446,24 +448,39 @@ impl TxUnpacker {
                     }
 
                     conway::Certificate::RegDRepCert(cred, coin, anchor) => {
-                        Ok(TxCertificate::DRepRegistration(DRepRegistration {
-                            credential: Self::map_stake_credential(cred),
-                            deposit: *coin,
-                            anchor: Self::map_nullable_anchor(&anchor),
+                        Ok(TxCertificate::DRepRegistration(DRepRegistrationWithPos {
+                            reg: DRepRegistration {
+                                credential: Self::map_stake_credential(cred),
+                                deposit: *coin,
+                                anchor: Self::map_nullable_anchor(&anchor),
+                            },
+                            tx_hash,
+                            cert_index: cert_index.try_into().unwrap(),
+                            epoch,
                         }))
                     }
 
-                    conway::Certificate::UnRegDRepCert(cred, coin) => {
-                        Ok(TxCertificate::DRepDeregistration(DRepDeregistration {
-                            credential: Self::map_stake_credential(cred),
-                            refund: *coin,
-                        }))
-                    }
+                    conway::Certificate::UnRegDRepCert(cred, coin) => Ok(
+                        TxCertificate::DRepDeregistration(DRepDeregistrationWithPos {
+                            reg: DRepDeregistration {
+                                credential: Self::map_stake_credential(cred),
+                                refund: *coin,
+                            },
+                            tx_hash,
+                            cert_index: cert_index.try_into().unwrap(),
+                            epoch,
+                        }),
+                    ),
 
                     conway::Certificate::UpdateDRepCert(cred, anchor) => {
-                        Ok(TxCertificate::DRepUpdate(DRepUpdate {
-                            credential: Self::map_stake_credential(cred),
-                            anchor: Self::map_nullable_anchor(&anchor),
+                        Ok(TxCertificate::DRepUpdate(DRepUpdateWithPos {
+                            reg: DRepUpdate {
+                                credential: Self::map_stake_credential(cred),
+                                anchor: Self::map_nullable_anchor(&anchor),
+                            },
+                            tx_hash,
+                            cert_index: cert_index.try_into().unwrap(),
+                            epoch,
                         }))
                     }
                 }
@@ -824,8 +841,9 @@ impl TxUnpacker {
                                         }
 
                                         if publish_certificates_topic.is_some() {
+                                            let tx_hash = tx.hash();
                                             for ( cert_index, cert) in certs.iter().enumerate() {
-                                                match Self::map_certificate(&cert, tx_index, cert_index) {
+                                                match Self::map_certificate(&cert, tx_index, *tx_hash, cert_index, block.epoch) {
                                                     Ok(tx_cert) => {
                                                         certificates.push(tx_cert);
                                                     },

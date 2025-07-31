@@ -46,22 +46,37 @@ pub struct DRepsList {
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct DRepInfo {
     pub deposit: Lovelace,
-    pub anchor: Option<Anchor>,
-    // Optional storage fields for rest_blockfrost
-    pub retired: Option<bool>,
-    pub expired: Option<bool>,
+    pub retired: bool,
+    pub expired: bool,
     pub active_epoch: Option<u64>,
-    pub last_active_epoch: Option<u64>,
+    pub last_active_epoch: u64,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct DRepDelegatorAddresses {}
 
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub struct DRepMetadata {}
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, Default)]
+pub struct DRepMetadata {
+    pub anchor: Option<Anchor>,
+}
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub struct DRepUpdates {}
+pub struct DRepUpdates {
+    pub updates: Vec<DRepUpdateEvent>,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct DRepUpdateEvent {
+    pub tx_hash: [u8; 32],
+    pub cert_index: u64,
+    pub action: DRepActionUpdate,
+}
+
+#[derive(serde::Serialize, serde::Deserialize, Clone, Debug)]
+pub enum DRepActionUpdate {
+    Registered,
+    Deregistered,
+}
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct DRepVotes {}

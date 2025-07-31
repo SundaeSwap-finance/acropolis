@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use acropolis_common::Vote;
+use acropolis_common::{queries::governance::DRepActionUpdate, Vote};
 use serde::Serialize;
 use serde_json::Value;
 
@@ -18,11 +18,11 @@ pub struct DRepInfoREST {
     pub hex: String,
     pub amount: String,
     pub active: bool,
-    pub active_epoch: u64,
+    pub active_epoch: Option<u64>,
     pub has_script: bool,
-    pub last_active_epoch: u64,
     pub retired: bool,
     pub expired: bool,
+    pub last_active_epoch: u64,
 }
 
 // REST response structure for /governance/dreps/{drep_id}/delegators
@@ -48,13 +48,7 @@ pub struct DRepMetadataREST {
 pub struct DRepUpdateREST {
     pub tx_hash: String,
     pub cert_index: u64,
-    pub action: DRepActionREST,
-}
-
-#[derive(Serialize)]
-pub enum DRepActionREST {
-    Registered,
-    Deregistered,
+    pub action: DRepActionUpdate,
 }
 
 // REST response structure for /governance/dreps/{drep_id}/votes
@@ -62,14 +56,7 @@ pub enum DRepActionREST {
 pub struct DRepVoteREST {
     pub tx_hash: String,
     pub cert_index: u64,
-    pub vote: VoteTypeREST,
-}
-
-#[derive(Serialize)]
-pub enum VoteTypeREST {
-    Yes,
-    No,
-    Abstain,
+    pub vote: Vote,
 }
 
 // REST response structure for /governance/proposals
@@ -81,14 +68,15 @@ pub struct ProposalsListREST {
 }
 
 #[derive(Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum ProposalTypeREST {
-    Hard_Fork_Initiation,
-    New_Committee,
-    New_Constitution,
-    Info_Action,
-    No_Confidence,
-    Parameter_Change,
-    Treasury_Withdrawals,
+    HardForkInitiation,
+    NewCommittee,
+    NewConstitution,
+    InfoAction,
+    NoConfidence,
+    ParameterChange,
+    TreasuryWithdrawals,
 }
 
 // REST response structure for /governance/proposals/{tx_hash}/{cert_index}
@@ -191,10 +179,11 @@ pub struct ProposalVoteREST {
 }
 
 #[derive(Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum VoterRoleREST {
-    Constitutional_Committee,
-    DRep,
-    SPO,
+    ConstitutionalCommittee,
+    Drep,
+    Spo,
 }
 
 // REST response structure for /governance/proposals/{tx_hash}/{cert_index}/metadata

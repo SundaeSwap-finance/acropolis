@@ -8,7 +8,7 @@ use anyhow::Result;
 use caryatid_sdk::Context;
 use std::sync::Arc;
 
-use crate::types::{DRepInfoREST, DRepsListREST, ProposalVoteREST, VoterRoleREST};
+use crate::types::{DRepInfoREST, DRepUpdateREST, DRepsListREST, ProposalVoteREST, VoterRoleREST};
 
 pub async fn handle_dreps_list_blockfrost(
     context: Arc<Context<Message>>,
@@ -36,7 +36,7 @@ pub async fn handle_dreps_list_blockfrost(
 
             Ok(RESTResponse::with_json(
                 200,
-                &serde_json::to_string(&response)?,
+                &serde_json::to_string_pretty(&response)?,
             ))
         }
 
@@ -83,39 +83,26 @@ pub async fn handle_single_drep_blockfrost(
         Message::StateQueryResponse(StateQueryResponse::Governance(
             GovernanceStateQueryResponse::DRepInfo(info),
         )) => {
-            let drep_id = credential.to_drep_bech32().unwrap_or_else(|_| "<invalid>".to_string());
-            let hex = hex::encode(credential.get_hash());
-            let has_script = matches!(credential, Credential::ScriptHash(_));
+            let active = !info.retired && !info.expired;
 
-            if let (Some(retired), Some(expired), Some(active_epoch), Some(last_active_epoch)) = (
-                info.retired,
-                info.expired,
-                info.active_epoch,
-                info.last_active_epoch,
-            ) {
-                let active = !retired && !expired;
+            let rest_info = DRepInfoREST {
+                drep_id: credential.to_drep_bech32().unwrap_or_else(|_| "<invalid>".to_string()),
+                hex: hex::encode(credential.get_hash()),
+                amount: info.deposit.to_string(),
+                active,
+                active_epoch: info.active_epoch, // <- allow null
+                has_script: matches!(credential, Credential::ScriptHash(_)),
+                last_active_epoch: info.last_active_epoch,
+                retired: info.retired,
+                expired: info.expired,
+            };
 
-                let rest_info = DRepInfoREST {
-                    drep_id,
-                    hex,
-                    amount: info.deposit.to_string(),
-                    active,
-                    active_epoch,
-                    has_script,
-                    last_active_epoch,
-                    retired,
-                    expired,
-                };
-
-                match serde_json::to_string(&rest_info) {
-                    Ok(json) => Ok(RESTResponse::with_json(200, &json)),
-                    Err(e) => Ok(RESTResponse::with_text(
-                        500,
-                        &format!("Failed to serialize DRep info: {e}"),
-                    )),
-                }
-            } else {
-                Ok(RESTResponse::with_text(501, "DRep REST endpoints disabled"))
+            match serde_json::to_string_pretty(&rest_info) {
+                Ok(json) => Ok(RESTResponse::with_json(200, &json)),
+                Err(e) => Ok(RESTResponse::with_text(
+                    500,
+                    &format!("Failed to serialize DRep info: {e}"),
+                )),
             }
         }
 
@@ -124,8 +111,11 @@ pub async fn handle_single_drep_blockfrost(
         )) => Ok(RESTResponse::with_text(404, "DRep not found")),
 
         Message::StateQueryResponse(StateQueryResponse::Governance(
-            GovernanceStateQueryResponse::Error(e),
-        )) => Ok(RESTResponse::with_text(500, &format!("Query error: {e}"))),
+            GovernanceStateQueryResponse::Error(_),
+        )) => Ok(RESTResponse::with_text(
+            500,
+            &format!("DRep info storage is disabled in config"),
+        )),
 
         _ => Ok(RESTResponse::with_text(500, "Unexpected message type")),
     }
@@ -146,10 +136,65 @@ pub async fn handle_drep_metadata_blockfrost(
 }
 
 pub async fn handle_drep_updates_blockfrost(
-    _context: Arc<Context<Message>>,
-    _params: Vec<String>,
+    context: Arc<Context<Message>>,
+    params: Vec<String>,
 ) -> Result<RESTResponse> {
-    Ok(RESTResponse::with_text(501, "Not implemented"))
+    let Some(drep_id) = params.get(0) else {
+        return Ok(RESTResponse::with_text(400, "Missing DRep ID parameter"));
+    };
+
+    let credential = match Credential::from_drep_bech32(drep_id) {
+        Ok(c) => c,
+        Err(e) => {
+            return Ok(RESTResponse::with_text(
+                400,
+                &format!("Invalid Bech32 DRep ID: {drep_id}. Error: {e}"),
+            ));
+        }
+    };
+
+    let msg = Arc::new(Message::StateQuery(StateQuery::Governance(
+        GovernanceStateQuery::GetDRepUpdates {
+            drep_credential: credential.clone(),
+        },
+    )));
+
+    let raw = context.message_bus.request("drep-state", msg).await?;
+    let message = Arc::try_unwrap(raw).unwrap_or_else(|arc| (*arc).clone());
+
+    match message {
+        Message::StateQueryResponse(StateQueryResponse::Governance(
+            GovernanceStateQueryResponse::DRepUpdates(list),
+        )) => {
+            let response: Vec<DRepUpdateREST> = list
+                .updates
+                .iter()
+                .map(|event| DRepUpdateREST {
+                    tx_hash: hex::encode(event.tx_hash),
+                    cert_index: event.cert_index,
+                    action: event.action.clone(),
+                })
+                .collect();
+
+            Ok(RESTResponse::with_json(
+                200,
+                &serde_json::to_string(&response)?,
+            ))
+        }
+
+        Message::StateQueryResponse(StateQueryResponse::Governance(
+            GovernanceStateQueryResponse::Error(_),
+        )) => Ok(RESTResponse::with_text(
+            503,
+            &format!("DRep updates storage is disabled in config"),
+        )),
+
+        Message::StateQueryResponse(StateQueryResponse::Governance(
+            GovernanceStateQueryResponse::NotFound,
+        )) => Ok(RESTResponse::with_text(404, "DRep not found")),
+
+        _ => Ok(RESTResponse::with_text(500, "Unexpected message type")),
+    }
 }
 
 pub async fn handle_drep_votes_blockfrost(
@@ -289,10 +334,10 @@ pub async fn handle_proposal_votes_blockfrost(
                 let voter_role = match voter {
                     Voter::ConstitutionalCommitteeKey(_)
                     | Voter::ConstitutionalCommitteeScript(_) => {
-                        VoterRoleREST::Constitutional_Committee
+                        VoterRoleREST::ConstitutionalCommittee
                     }
-                    Voter::DRepKey(_) | Voter::DRepScript(_) => VoterRoleREST::DRep,
-                    Voter::StakePoolKey(_) => VoterRoleREST::SPO,
+                    Voter::DRepKey(_) | Voter::DRepScript(_) => VoterRoleREST::Drep,
+                    Voter::StakePoolKey(_) => VoterRoleREST::Spo,
                 };
 
                 let voter_str = voter.to_string();
