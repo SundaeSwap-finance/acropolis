@@ -4,7 +4,8 @@
 use acropolis_common::{
     messages::{CardanoMessage, DRepStateMessage, Message, StateQuery, StateQueryResponse},
     queries::governance::{
-        DRepInfo, DRepsList, GovernanceStateQuery, GovernanceStateQueryResponse,
+        DRepDelegatorAddresses, DRepInfo, DRepInfoWithDelegators, DRepMetadata, DRepUpdates,
+        DRepVotes, DRepsList, GovernanceStateQuery, GovernanceStateQueryResponse,
     },
 };
 use anyhow::Result;
@@ -68,6 +69,7 @@ impl DRepState {
         let state1 = state.clone();
         let mut subscription = context.subscribe(&subscribe_topic).await?;
         let context_subscribe = context.clone();
+        let context_cert_handler = context.clone();
         context.run(async move {
             loop {
                 let Ok((_, message)) = subscription.read().await else {
@@ -75,11 +77,12 @@ impl DRepState {
                 };
                 match message.as_ref() {
                     Message::Cardano((block_info, CardanoMessage::TxCertificates(tx_cert_msg))) => {
+                        let context_handle = context_cert_handler.clone();
                         let span = info_span!("drep_state.handle", block = block_info.number);
                         async {
                             let mut state = state1.lock().await;
                             state
-                                .handle(&tx_cert_msg)
+                                .handle(context_handle, &tx_cert_msg)
                                 .await
                                 .inspect_err(|e| error!("Messaging handling error: {e}"))
                                 .ok();
@@ -128,21 +131,75 @@ impl DRepState {
                         let dreps = locked.list();
                         GovernanceStateQueryResponse::DRepsList(DRepsList { dreps })
                     }
-                    GovernanceStateQuery::GetDRepInfo { drep_credential } => {
-                        match locked.get_historical_drep(&drep_credential) {
-                            Some(record) => match &record.info {
-                                Some(info) => GovernanceStateQueryResponse::DRepInfo(DRepInfo {
-                                    deposit: info.deposit,
-                                    retired: info.retired,
-                                    expired: info.expired,
-                                    active_epoch: info.active_epoch,
-                                    last_active_epoch: info.last_active_epoch,
-                                }),
-                                None => GovernanceStateQueryResponse::Error(
-                                    "DRep info storage is disabled by configuration.".to_string(),
-                                ),
+                    GovernanceStateQuery::GetDRepInfoWithDelegators { drep_credential } => {
+                        match locked.get_drep_info(&drep_credential) {
+                            Ok(Some(info)) => match locked.get_drep_delegators(&drep_credential) {
+                                Ok(Some(delegators)) => {
+                                    let response = DRepInfoWithDelegators {
+                                        info: DRepInfo {
+                                            deposit: info.deposit,
+                                            retired: info.retired,
+                                            expired: info.expired,
+                                            active_epoch: info.active_epoch,
+                                            last_active_epoch: info.last_active_epoch,
+                                        },
+                                        delegators: delegators.to_vec(),
+                                    };
+
+                                    GovernanceStateQueryResponse::DRepInfoWithDelegators(response)
+                                }
+
+                                Ok(None) => GovernanceStateQueryResponse::NotFound,
+
+                                Err(msg) => GovernanceStateQueryResponse::Error(msg.to_string()),
                             },
-                            None => GovernanceStateQueryResponse::NotFound,
+
+                            Ok(None) => GovernanceStateQueryResponse::NotFound,
+
+                            Err(msg) => GovernanceStateQueryResponse::Error(msg.to_string()),
+                        }
+                    }
+
+                    GovernanceStateQuery::GetDRepDelegators { drep_credential } => {
+                        match locked.get_drep_delegators(&drep_credential) {
+                            Ok(Some(delegators)) => GovernanceStateQueryResponse::DRepDelegators(
+                                DRepDelegatorAddresses {
+                                    addresses: delegators.clone(),
+                                },
+                            ),
+                            Ok(None) => GovernanceStateQueryResponse::NotFound,
+                            Err(msg) => GovernanceStateQueryResponse::Error(msg.to_string()),
+                        }
+                    }
+                    GovernanceStateQuery::GetDRepMetadata { drep_credential } => {
+                        match locked.get_drep_anchor(&drep_credential) {
+                            Ok(Some(anchor)) => {
+                                GovernanceStateQueryResponse::DRepMetadata(DRepMetadata {
+                                    anchor: Some(anchor.clone()),
+                                })
+                            }
+                            Ok(None) => GovernanceStateQueryResponse::NotFound,
+                            Err(msg) => GovernanceStateQueryResponse::Error(msg.to_string()),
+                        }
+                    }
+                    GovernanceStateQuery::GetDRepUpdates { drep_credential } => {
+                        match locked.get_drep_updates(&drep_credential) {
+                            Ok(Some(updates)) => {
+                                GovernanceStateQueryResponse::DRepUpdates(DRepUpdates {
+                                    updates: updates.to_vec(),
+                                })
+                            }
+                            Ok(None) => GovernanceStateQueryResponse::NotFound,
+                            Err(msg) => GovernanceStateQueryResponse::Error(msg.to_string()),
+                        }
+                    }
+                    GovernanceStateQuery::GetDRepVotes { drep_credential } => {
+                        match locked.get_drep_votes(drep_credential) {
+                            Ok(Some(votes)) => GovernanceStateQueryResponse::DRepVotes(DRepVotes {
+                                votes: votes.to_vec(),
+                            }),
+                            Ok(None) => GovernanceStateQueryResponse::NotFound,
+                            Err(msg) => GovernanceStateQueryResponse::Error(msg.to_string()),
                         }
                     }
                     _ => GovernanceStateQueryResponse::Error(format!(
