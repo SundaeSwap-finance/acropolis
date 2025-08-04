@@ -14,7 +14,8 @@ use serde_json::Value;
 use std::sync::Arc;
 
 use crate::types::{
-    DRepInfoREST, DRepMetadataREST, DRepUpdateREST, DRepsListREST, ProposalVoteREST, VoterRoleREST,
+    DRepInfoREST, DRepMetadataREST, DRepUpdateREST, DRepVoteREST, DRepsListREST, ProposalVoteREST,
+    VoterRoleREST,
 };
 
 pub async fn handle_dreps_list_blockfrost(
@@ -217,7 +218,7 @@ pub async fn handle_drep_delegators_blockfrost(
                 Ok(json) => Ok(RESTResponse::with_json(200, &json)),
                 Err(e) => Ok(RESTResponse::with_text(
                     500,
-                    &format!("Failed to serialize DRep info: {e}"),
+                    &format!("Failed to serialize DRep delegators: {e}"),
                 )),
             }
         }
@@ -284,10 +285,13 @@ pub async fn handle_drep_metadata_blockfrost(
                                     bytes: bytes_hex,
                                 };
 
-                                Ok(RESTResponse::with_json(
-                                    200,
-                                    &serde_json::to_string_pretty(&response)?,
-                                ))
+                                match serde_json::to_string_pretty(&response) {
+                                    Ok(json) => Ok(RESTResponse::with_json(200, &json)),
+                                    Err(e) => Ok(RESTResponse::with_text(
+                                        500,
+                                        &format!("Failed to serialize DRep metadata: {e}"),
+                                    )),
+                                }
                             }
                             Err(_) => Ok(RESTResponse::with_text(
                                 500,
@@ -365,10 +369,13 @@ pub async fn handle_drep_updates_blockfrost(
                 })
                 .collect();
 
-            Ok(RESTResponse::with_json(
-                200,
-                &serde_json::to_string_pretty(&response)?,
-            ))
+            match serde_json::to_string_pretty(&response) {
+                Ok(json) => Ok(RESTResponse::with_json(200, &json)),
+                Err(e) => Ok(RESTResponse::with_text(
+                    500,
+                    &format!("Failed to serialize DRep updates: {e}"),
+                )),
+            }
         }
 
         Message::StateQueryResponse(StateQueryResponse::Governance(
@@ -387,10 +394,67 @@ pub async fn handle_drep_updates_blockfrost(
 }
 
 pub async fn handle_drep_votes_blockfrost(
-    _context: Arc<Context<Message>>,
-    _params: Vec<String>,
+    context: Arc<Context<Message>>,
+    params: Vec<String>,
 ) -> Result<RESTResponse> {
-    Ok(RESTResponse::with_text(501, "Not implemented"))
+    let Some(drep_id) = params.get(0) else {
+        return Ok(RESTResponse::with_text(400, "Missing DRep ID parameter"));
+    };
+
+    let credential = match Credential::from_drep_bech32(drep_id) {
+        Ok(c) => c,
+        Err(e) => {
+            return Ok(RESTResponse::with_text(
+                400,
+                &format!("Invalid Bech32 DRep ID: {drep_id}. Error: {e}"),
+            ));
+        }
+    };
+
+    let msg = Arc::new(Message::StateQuery(StateQuery::Governance(
+        GovernanceStateQuery::GetDRepVotes {
+            drep_credential: credential.clone(),
+        },
+    )));
+
+    let raw_msg = context.message_bus.request("drep-state", msg).await?;
+    let message = Arc::try_unwrap(raw_msg).unwrap_or_else(|arc| (*arc).clone());
+    match message {
+        Message::StateQueryResponse(StateQueryResponse::Governance(
+            GovernanceStateQueryResponse::DRepVotes(votes),
+        )) => {
+            let response: Vec<_> = votes
+                .votes
+                .iter()
+                .map(|vote| DRepVoteREST {
+                    tx_hash: hex::encode(&vote.tx_hash),
+                    cert_index: vote.cert_index,
+                    vote: vote.vote.clone(),
+                })
+                .collect();
+
+            match serde_json::to_string_pretty(&response) {
+                Ok(json) => Ok(RESTResponse::with_json(200, &json)),
+                Err(e) => Ok(RESTResponse::with_text(
+                    500,
+                    &format!("Failed to serialize DRep votes: {e}"),
+                )),
+            }
+        }
+
+        Message::StateQueryResponse(StateQueryResponse::Governance(
+            GovernanceStateQueryResponse::NotFound,
+        )) => Ok(RESTResponse::with_text(404, "DRep not found")),
+
+        Message::StateQueryResponse(StateQueryResponse::Governance(
+            GovernanceStateQueryResponse::Error(_),
+        )) => Ok(RESTResponse::with_text(
+            503,
+            "DRep vote storage is disabled in config",
+        )),
+
+        _ => Ok(RESTResponse::with_text(500, "Unexpected message type")),
+    }
 }
 
 pub async fn handle_proposals_list_blockfrost(

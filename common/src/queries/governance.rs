@@ -96,7 +96,7 @@ pub struct DRepVotes {
 #[derive(Clone, serde::Serialize, serde::Deserialize, Debug)]
 pub struct VoteRecord {
     pub tx_hash: String,
-    pub cert_index: u64,
+    pub cert_index: usize,
     pub vote: Vote,
 }
 

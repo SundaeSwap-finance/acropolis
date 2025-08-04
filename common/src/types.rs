@@ -1199,6 +1199,7 @@ pub enum Vote {
 pub struct VotingProcedure {
     pub vote: Vote,
     pub anchor: Option<Anchor>,
+    pub vote_index: usize,
 }
 
 #[serde_as]
@@ -1422,6 +1423,7 @@ mod tests {
             VotingProcedure {
                 anchor: None,
                 vote: Vote::Abstain,
+                vote_index: 0,
             },
         );
         voting.votes.insert(

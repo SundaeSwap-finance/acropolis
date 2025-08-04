@@ -20,7 +20,10 @@ use state::State;
 
 use crate::state::DRepStorageConfig;
 
-const DEFAULT_SUBSCRIBE_TOPIC: (&str, &str) = ("subscribe-topic", "cardano.certificates");
+const DEFAULT_CERTIFICATES_SUBSCRIBE_TOPIC: (&str, &str) =
+    ("certificates-subscribe-topic", "cardano.certificates");
+const DEFAULT_GOVERNANCE_SUBSCRIBE_TOPIC: (&str, &str) =
+    ("governance-subscribe-topic", "cardano.governance");
 const DEFAULT_DREP_STATE_TOPIC: (&str, &str) = ("publish-drep-state-topic", "cardano.drep.state");
 
 const DEFAULT_STORE_INFO: (&str, bool) = ("store-info", false);
@@ -49,8 +52,9 @@ impl DRepState {
         }
 
         // Get configuration
-        let subscribe_topic = get_string(&config, DEFAULT_SUBSCRIBE_TOPIC);
-        info!("Creating subscriber on '{subscribe_topic}'");
+        let certificates_subscribe_topic =
+            get_string(&config, DEFAULT_CERTIFICATES_SUBSCRIBE_TOPIC);
+        info!("Creating subscriber on '{certificates_subscribe_topic}'");
 
         let drep_state_topic = get_string(&config, DEFAULT_DREP_STATE_TOPIC);
         info!("Creating DRep state publisher on '{drep_state_topic}'");
@@ -63,11 +67,11 @@ impl DRepState {
             store_votes: get_flag(&config, DEFAULT_STORE_VOTES),
         };
 
-        let state = Arc::new(Mutex::new(State::new(storage_config)));
+        let state = Arc::new(Mutex::new(State::new(storage_config.clone())));
 
         // Subscribe for certificate messages
         let state1 = state.clone();
-        let mut subscription = context.subscribe(&subscribe_topic).await?;
+        let mut subscription = context.subscribe(&certificates_subscribe_topic).await?;
         let context_subscribe = context.clone();
         let context_cert_handler = context.clone();
         context.run(async move {
@@ -82,7 +86,7 @@ impl DRepState {
                         async {
                             let mut state = state1.lock().await;
                             state
-                                .handle(context_handle, &tx_cert_msg)
+                                .handle_certificates(context_handle, &tx_cert_msg)
                                 .await
                                 .inspect_err(|e| error!("Messaging handling error: {e}"))
                                 .ok();
@@ -111,6 +115,46 @@ impl DRepState {
                 }
             }
         });
+
+        // Optionally subscribe to governance messages to process and store DRep votes
+        if storage_config.store_votes {
+            let governance_subscribe_topic =
+                get_string(&config, DEFAULT_GOVERNANCE_SUBSCRIBE_TOPIC);
+            info!("Creating subscriber on '{governance_subscribe_topic}'");
+
+            let state_votes = state.clone();
+            let mut procedures_subscription =
+                context.subscribe(&governance_subscribe_topic).await?;
+
+            context.run(async move {
+                loop {
+                    let Ok((_, message)) = procedures_subscription.read().await else {
+                        return;
+                    };
+
+                    if let Message::Cardano((
+                        block_info,
+                        CardanoMessage::GovernanceProcedures(proc_msg),
+                    )) = message.as_ref()
+                    {
+                        let span = info_span!("drep_state.handle_votes", block = block_info.number);
+                        async {
+                            state_votes
+                                .lock()
+                                .await
+                                .handle_votes(&proc_msg)
+                                .await
+                                .inspect_err(|e| {
+                                    error!("Failed to handle governance procedures: {e}")
+                                })
+                                .ok();
+                        }
+                        .instrument(span)
+                        .await;
+                    }
+                }
+            });
+        }
 
         let query_state = state.clone();
         context.handle("drep-state", move |message| {
@@ -213,7 +257,7 @@ impl DRepState {
         });
 
         // Ticker to log stats
-        let mut subscription = context.subscribe(&subscribe_topic).await?;
+        let mut subscription = context.subscribe(&certificates_subscribe_topic).await?;
         let state2 = state.clone();
         context.run(async move {
             loop {

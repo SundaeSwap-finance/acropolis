@@ -1,12 +1,15 @@
 //! Acropolis DRepState: State storage
 
 use acropolis_common::{
-    messages::{Message, StateQuery, StateQueryResponse, TxCertificatesMessage},
+    messages::{
+        GovernanceProceduresMessage, Message, StateQuery, StateQueryResponse, TxCertificatesMessage,
+    },
     queries::{
         accounts::{AccountsStateQuery, AccountsStateQueryResponse},
         governance::{DRepActionUpdate, DRepMetadata, DRepUpdateEvent, VoteRecord},
     },
     Anchor, Credential, DRepChoice, DRepCredential, Lovelace, StakeCredential, TxCertificate,
+    Voter,
 };
 use anyhow::{anyhow, Result};
 use caryatid_sdk::Context;
@@ -366,7 +369,7 @@ impl State {
         Ok(false)
     }
 
-    pub async fn handle(
+    pub async fn handle_certificates(
         &mut self,
         context: Arc<Context<Message>>,
         tx_cert_msg: &TxCertificatesMessage,
@@ -393,6 +396,46 @@ impl State {
             }
         }
 
+        Ok(())
+    }
+
+    pub async fn handle_votes(
+        &mut self,
+        governance_msg: &GovernanceProceduresMessage,
+    ) -> Result<()> {
+        if !self.config.store_votes {
+            return Ok(());
+        }
+
+        let Some(hist_map) = self.historical_dreps.as_mut() else {
+            return Ok(());
+        };
+
+        for (tx_hash, voting_procedures) in &governance_msg.voting_procedures {
+            for (voter, single_votes) in &voting_procedures.votes {
+                // Only retrieve DRep votes
+                let drep_cred = match voter {
+                    Voter::DRepKey(keyhash) => DRepCredential::AddrKeyHash(keyhash.to_vec()),
+                    Voter::DRepScript(scripthash) => {
+                        DRepCredential::ScriptHash(scripthash.to_vec())
+                    }
+                    _ => continue,
+                };
+
+                // For each vote cast by this DRep
+                for (_gov_action_id, voting_procedure) in &single_votes.voting_procedures {
+                    if let Some(entry) = hist_map.get_mut(&drep_cred) {
+                        if let Some(votes) = entry.votes.as_mut() {
+                            votes.push(VoteRecord {
+                                tx_hash: hex::encode(tx_hash),
+                                cert_index: voting_procedure.vote_index,
+                                vote: voting_procedure.vote.clone(),
+                            });
+                        }
+                    }
+                }
+            }
+        }
         Ok(())
     }
 

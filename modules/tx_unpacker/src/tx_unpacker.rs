@@ -679,10 +679,14 @@ impl TxUnpacker {
         }
     }
 
-    fn map_single_governance_voting_procedure(proc: &conway::VotingProcedure) -> VotingProcedure {
+    fn map_single_governance_voting_procedure(
+        proc: &conway::VotingProcedure,
+        vote_index: usize,
+    ) -> VotingProcedure {
         VotingProcedure {
             vote: Self::map_vote(&proc.vote),
             anchor: Self::map_nullable_anchor(&proc.anchor),
+            vote_index,
         }
     }
 
@@ -693,22 +697,33 @@ impl TxUnpacker {
             votes: HashMap::new(),
         };
 
+        let mut vote_index = 0;
+
         for (pallas_voter, pallas_pair) in vote_procs.iter() {
             let voter = Self::map_voter(pallas_voter);
 
             if let Some(existing) = procs.votes.insert(voter.clone(), SingleVoterVotes::default()) {
-                return Err(anyhow!("Duplicate voter {:?} in governance voting procedures: {:?}, existing {existing:?}", voter, vote_procs));
+                return Err(anyhow!(
+                "Duplicate voter {:?} in governance voting procedures: {:?}, existing {existing:?}",
+                voter,
+                vote_procs
+            ));
             }
 
             let single_voter = procs
                 .votes
                 .get_mut(&voter)
-                .ok_or_else(|| anyhow!("Cannot find voter {:?}, which must present", voter))?;
+                .ok_or_else(|| anyhow!("Cannot find voter {:?}, which must be present", voter))?;
 
             for (pallas_action_id, pallas_voting_procedure) in pallas_pair.iter() {
                 let action_id = Self::map_gov_action_id(pallas_action_id)?;
-                let vp = Self::map_single_governance_voting_procedure(&pallas_voting_procedure);
+                let vp = Self::map_single_governance_voting_procedure(
+                    &pallas_voting_procedure,
+                    vote_index,
+                );
+
                 single_voter.voting_procedures.insert(action_id, vp);
+                vote_index += 1;
             }
         }
 
