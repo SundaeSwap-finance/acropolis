@@ -32,6 +32,8 @@ const DEFAULT_SPO_DISTRIBUTION_TOPIC: (&str, &str) =
 const DEFAULT_PROTOCOL_PARAMETERS_TOPIC: (&str, &str) =
     ("protocol-parameters-topic", "cardano.protocol.parameters");
 const DEFAULT_ENACT_STATE_TOPIC: (&str, &str) = ("enact-state-topic", "cardano.enact.state");
+const DEFAULT_GOVERNANCE_QUERY_TOPIC: (&str, &str) =
+    ("dreps-state-query-topic", "cardano.query.governance");
 
 /// Governance State module
 #[module(
@@ -47,6 +49,7 @@ pub struct GovernanceStateConfig {
     spo_distribution_topic: String,
     protocol_parameters_topic: String,
     enact_state_topic: String,
+    governance_query_topic: String,
 }
 
 impl GovernanceStateConfig {
@@ -63,6 +66,7 @@ impl GovernanceStateConfig {
             spo_distribution_topic: Self::conf(config, DEFAULT_SPO_DISTRIBUTION_TOPIC),
             protocol_parameters_topic: Self::conf(config, DEFAULT_PROTOCOL_PARAMETERS_TOPIC),
             enact_state_topic: Self::conf(config, DEFAULT_ENACT_STATE_TOPIC),
+            governance_query_topic: Self::conf(config, DEFAULT_GOVERNANCE_QUERY_TOPIC),
         })
     }
 }
@@ -152,14 +156,16 @@ impl GovernanceState {
                                 .await
                                 .inspect_err(|e| error!("Tick error: {e}"))
                                 .ok();
-                        }.instrument(span).await;
+                        }
+                        .instrument(span)
+                        .await;
                     }
                 }
             }
         });
 
         let query_state = state.clone();
-        context.handle("governance-state", move |message| {
+        context.handle(&config.governance_query_topic, move |message| {
             let state_handle = query_state.clone();
             async move {
                 let Message::StateQuery(StateQuery::Governance(query)) = message.as_ref() else {

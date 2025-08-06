@@ -2,7 +2,10 @@
 use std::sync::Arc;
 
 use acropolis_common::messages::{Message, RESTResponse, StateQuery, StateQueryResponse};
-use acropolis_common::queries::accounts::{AccountsStateQuery, AccountsStateQueryResponse};
+use acropolis_common::queries::accounts::{
+    AccountsStateQuery, AccountsStateQueryResponse, DEFAULT_ACCOUNTS_QUERY_TOPIC,
+};
+use acropolis_common::queries::get_query_topic;
 use acropolis_common::serialization::Bech32WithHrp;
 use acropolis_common::{Address, DRepChoice, StakeAddress, StakeAddressPayload};
 use anyhow::{anyhow, Result};
@@ -54,7 +57,8 @@ pub async fn handle_single_account_blockfrost(
     )));
 
     // Send message via message bus
-    let raw = context.message_bus.request("accounts-state", msg).await?;
+    let accounts_query_topic = get_query_topic(context.clone(), DEFAULT_ACCOUNTS_QUERY_TOPIC);
+    let raw = context.message_bus.request(&accounts_query_topic, msg).await?;
 
     // Unwrap and match
     let message = Arc::try_unwrap(raw).unwrap_or_else(|arc| (*arc).clone());

@@ -336,7 +336,6 @@ impl TxUnpacker {
                         }))
                     }
                     conway::Certificate::PoolRegistration {
-                        // TODO relays, pool_metadata
                         operator,
                         vrf_keyhash,
                         pledge,

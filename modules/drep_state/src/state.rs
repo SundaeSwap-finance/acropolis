@@ -5,7 +5,8 @@ use acropolis_common::{
         GovernanceProceduresMessage, Message, StateQuery, StateQueryResponse, TxCertificatesMessage,
     },
     queries::{
-        accounts::{AccountsStateQuery, AccountsStateQueryResponse},
+        accounts::{AccountsStateQuery, AccountsStateQueryResponse, DEFAULT_ACCOUNTS_QUERY_TOPIC},
+        get_query_topic,
         governance::{DRepActionUpdate, DRepMetadata, DRepUpdateEvent, VoteRecord},
     },
     Anchor, Credential, DRepChoice, DRepCredential, Lovelace, StakeCredential, TxCertificate,
@@ -30,12 +31,9 @@ pub struct HistoricalDRepState {
     // - DRepRegistration
     // - DRepDeregistration
     // - DRepUpdate
+    // TODO: Mark DRep as expired based on last_active_epoch and drep_activity protocol param during epoch transition
     pub info: Option<DRepRecordExtended>,
-
-    // Populated from the same certificates as info
     pub updates: Option<Vec<DRepUpdateEvent>>,
-
-    // Populated from the reg.anchor field in DRep certificates
     pub metadata: Option<DRepMetadata>,
 
     // Populated from the drep and credential fields in:
@@ -138,7 +136,10 @@ impl State {
             .as_ref()
             .ok_or("DRep info storage is disabled by configuration.")?;
 
-        let entry = historical.get(credential).ok_or("DRep not found")?;
+        let entry = match historical.get(credential) {
+            Some(e) => e,
+            None => return Ok(None),
+        };
 
         match &entry.info {
             Some(info) => Ok(Some(info)),
@@ -154,7 +155,10 @@ impl State {
             .historical_dreps
             .as_ref()
             .ok_or("DRep delegator storage is disabled by configuration.")?;
-        let entry = historical.get(credential).ok_or("DRep not found")?;
+        let entry = match historical.get(credential) {
+            Some(e) => e,
+            None => return Ok(None),
+        };
         match &entry.delegators {
             Some(vec) => Ok(Some(vec)),
             None => Err("DRep delegator storage is disabled by configuration."),
@@ -189,7 +193,10 @@ impl State {
             .as_ref()
             .ok_or("DRep updates storage is disabled by configuration.")?;
 
-        let entry = historical.get(credential).ok_or("DRep not found")?;
+        let entry = match historical.get(credential) {
+            Some(e) => e,
+            None => return Ok(None),
+        };
 
         match &entry.updates {
             Some(updates) => Ok(Some(updates)),
@@ -206,7 +213,10 @@ impl State {
             .as_ref()
             .ok_or("DRep votes storage is disabled by configuration.")?;
 
-        let entry = historical.get(credential).ok_or("DRep not found")?;
+        let entry = match historical.get(credential) {
+            Some(e) => e,
+            None => return Ok(None),
+        };
 
         match &entry.votes {
             Some(votes) => Ok(Some(votes)),
@@ -339,60 +349,42 @@ impl State {
         }
     }
 
-    async fn process_delegation_certificate_async(
-        &mut self,
-        context: Arc<Context<Message>>,
-        tx_cert: &TxCertificate,
-    ) -> Result<bool> {
-        match tx_cert {
-            TxCertificate::VoteDelegation(deleg) if self.config.store_delegators => {
-                self.update_delegator(context, &deleg.credential, &deleg.drep).await;
-            }
-
-            TxCertificate::StakeAndVoteDelegation(deleg) if self.config.store_delegators => {
-                self.update_delegator(context, &deleg.credential, &deleg.drep).await;
-            }
-
-            TxCertificate::StakeRegistrationAndVoteDelegation(deleg)
-                if self.config.store_delegators =>
-            {
-                self.update_delegator(context, &deleg.credential, &deleg.drep).await;
-            }
-
-            TxCertificate::StakeRegistrationAndStakeAndVoteDelegation(deleg)
-                if self.config.store_delegators =>
-            {
-                self.update_delegator(context, &deleg.credential, &deleg.drep).await;
-            }
-            _ => {}
-        }
-        Ok(false)
-    }
-
     pub async fn handle_certificates(
         &mut self,
         context: Arc<Context<Message>>,
         tx_cert_msg: &TxCertificatesMessage,
     ) -> Result<()> {
+        let mut batched_delegators = Vec::new();
+
         for tx_cert in &tx_cert_msg.certificates {
-            let result = match tx_cert {
-                // If store-delegators is enabled use async logic to process delegation certs.
-                // Async query to accounts_state need to retrieve previous delegation.
-                TxCertificate::VoteDelegation(_)
-                | TxCertificate::StakeAndVoteDelegation(_)
-                | TxCertificate::StakeRegistrationAndVoteDelegation(_)
-                | TxCertificate::StakeRegistrationAndStakeAndVoteDelegation(_)
+            match tx_cert {
+                TxCertificate::VoteDelegation(d) if self.config.store_delegators => {
+                    batched_delegators.push((&d.credential, &d.drep));
+                }
+                TxCertificate::StakeAndVoteDelegation(d) if self.config.store_delegators => {
+                    batched_delegators.push((&d.credential, &d.drep));
+                }
+                TxCertificate::StakeRegistrationAndVoteDelegation(d)
                     if self.config.store_delegators =>
                 {
-                    self.process_delegation_certificate_async(context.clone(), tx_cert).await
+                    batched_delegators.push((&d.credential, &d.drep));
                 }
+                TxCertificate::StakeRegistrationAndStakeAndVoteDelegation(d)
+                    if self.config.store_delegators =>
+                {
+                    batched_delegators.push((&d.credential, &d.drep));
+                }
+                _ => {
+                    if let Err(e) = self.process_registration_certificate_sync(tx_cert) {
+                        tracing::error!("Error processing tx_cert: {e}");
+                    }
+                }
+            }
+        }
 
-                // Everything else = sync path
-                _ => self.process_registration_certificate_sync(tx_cert),
-            };
-
-            if let Err(e) = result {
-                tracing::error!("Error processing tx_cert: {e}");
+        if self.config.store_delegators && !batched_delegators.is_empty() {
+            if let Err(e) = self.update_delegators(context.clone(), batched_delegators).await {
+                tracing::error!("Error processing batched delegators: {e}");
             }
         }
 
@@ -427,7 +419,7 @@ impl State {
                     if let Some(entry) = hist_map.get_mut(&drep_cred) {
                         if let Some(votes) = entry.votes.as_mut() {
                             votes.push(VoteRecord {
-                                tx_hash: hex::encode(tx_hash),
+                                tx_hash: tx_hash.clone(),
                                 cert_index: voting_procedure.vote_index,
                                 vote: voting_procedure.vote.clone(),
                             });
@@ -464,67 +456,73 @@ impl State {
         }
     }
 
-    async fn update_delegator(
+    pub async fn update_delegators(
         &mut self,
         context: Arc<Context<Message>>,
-        delegator: &StakeCredential,
-        drep: &DRepChoice,
-    ) {
-        let new_drep_cred = match drep_choice_to_credential(drep) {
-            Some(c) => c,
-            None => return,
-        };
+        delegators: Vec<(&StakeCredential, &DRepChoice)>,
+    ) -> Result<()> {
+        let stake_keys: Vec<_> = delegators.iter().map(|(sc, _)| sc.get_hash()).collect();
 
-        // Remove delegator from old DRep if different
-        let stake_key = delegator.get_hash();
-        let msg = Arc::new(Message::StateQuery(StateQuery::Accounts(
-            AccountsStateQuery::GetAccountDRepDelegation { stake_key },
-        )));
-
-        match context.message_bus.request("accounts-state", msg).await {
-            Ok(response) => {
-                let message = Arc::try_unwrap(response).unwrap_or_else(|arc| (*arc).clone());
-                match message {
-                    Message::StateQueryResponse(StateQueryResponse::Accounts(
-                        AccountsStateQueryResponse::AccountDRepDelegation(old_drep_opt),
-                    )) => {
-                        if let Some(old_drep) = old_drep_opt {
-                            if let Some(old_drep_cred) = drep_choice_to_credential(&old_drep) {
-                                if old_drep_cred == new_drep_cred {
-                                    // Same as current — nothing to change
-                                    return;
-                                }
-                                self.update_historical_if_exists(&old_drep_cred, |entry| {
-                                    if let Some(delegators) = entry.delegators.as_mut() {
-                                        delegators.retain(|s| s != delegator);
-                                    }
-                                });
-                            }
-                        }
-                    }
-                    Message::StateQueryResponse(StateQueryResponse::Accounts(
-                        AccountsStateQueryResponse::NotFound,
-                    )) => {
-                        tracing::error!("Delegator {:?} not found in accounts-state", delegator);
-                    }
-                    _ => {
-                        tracing::warn!("Unexpected accounts-state response: {:?}", message);
-                    }
-                }
-            }
-            Err(e) => {
-                tracing::error!("Failed to query accounts-state: {e}");
-            }
+        let mut stake_key_to_input: HashMap<_, (&StakeCredential, &DRepChoice)> = HashMap::new();
+        for (i, (sc, drep)) in delegators.iter().enumerate() {
+            stake_key_to_input.insert(stake_keys[i].clone(), (*sc, *drep));
         }
 
-        // Add delegator to new DRep
-        self.update_historical(&new_drep_cred, |entry| {
-            if let Some(delegators) = entry.delegators.as_mut() {
-                if !delegators.contains(delegator) {
-                    delegators.push(delegator.clone());
+        let msg = Arc::new(Message::StateQuery(StateQuery::Accounts(
+            AccountsStateQuery::GetAccountsDrepDelegationsMap {
+                stake_keys: stake_keys.clone(),
+            },
+        )));
+
+        let accounts_query_topic = get_query_topic(context.clone(), DEFAULT_ACCOUNTS_QUERY_TOPIC);
+        let response = context.message_bus.request(&accounts_query_topic, msg).await?;
+        let message = Arc::try_unwrap(response).unwrap_or_else(|arc| (*arc).clone());
+
+        let result_map = match message {
+            Message::StateQueryResponse(StateQueryResponse::Accounts(
+                AccountsStateQueryResponse::AccountsDrepDelegationsMap(map),
+            )) => map,
+            _ => {
+                return Err(anyhow!("Unexpected accounts-state response"));
+            }
+        };
+
+        for (stake_key, old_drep_opt) in result_map {
+            let (delegator, new_drep_choice) = match stake_key_to_input.get(&stake_key) {
+                Some(pair) => *pair,
+                None => continue,
+            };
+
+            let new_drep_cred = match drep_choice_to_credential(new_drep_choice) {
+                Some(c) => c,
+                None => continue,
+            };
+
+            if let Some(old_drep) = old_drep_opt {
+                if let Some(old_drep_cred) = drep_choice_to_credential(&old_drep) {
+                    if old_drep_cred == new_drep_cred {
+                        continue;
+                    }
+
+                    self.update_historical_if_exists(&old_drep_cred, |entry| {
+                        if let Some(delegators) = entry.delegators.as_mut() {
+                            delegators.retain(|s| s != delegator);
+                        }
+                    });
                 }
             }
-        });
+
+            // Add delegator to new DRep
+            self.update_historical(&new_drep_cred, |entry| {
+                if let Some(delegators) = entry.delegators.as_mut() {
+                    if !delegators.contains(delegator) {
+                        delegators.push(delegator.clone());
+                    }
+                }
+            });
+        }
+
+        Ok(())
     }
 }
 

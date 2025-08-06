@@ -5,6 +5,11 @@ use crate::{
     VotingProcedure,
 };
 
+pub const DEFAULT_DREPS_QUERY_TOPIC: (&str, &str) =
+    ("drep-state-query-topic", "cardano.query.dreps");
+pub const DEFAULT_GOVERNANCE_QUERY_TOPIC: (&str, &str) =
+    ("governance-state-query-topic", "cardano.query.governance");
+
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub enum GovernanceStateQuery {
     GetDRepsList,
@@ -95,7 +100,7 @@ pub struct DRepVotes {
 
 #[derive(Clone, serde::Serialize, serde::Deserialize, Debug)]
 pub struct VoteRecord {
-    pub tx_hash: String,
+    pub tx_hash: Vec<u8>,
     pub cert_index: usize,
     pub vote: Vote,
 }

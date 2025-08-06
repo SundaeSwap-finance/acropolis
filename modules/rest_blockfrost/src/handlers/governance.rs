@@ -1,9 +1,17 @@
 //! REST handlers for Acropolis Blockfrost /governance endpoints
+use crate::types::{
+    DRepInfoREST, DRepMetadataREST, DRepUpdateREST, DRepVoteREST, DRepsListREST, ProposalVoteREST,
+    VoterRoleREST,
+};
 use acropolis_common::{
     messages::{Message, RESTResponse, StateQuery, StateQueryResponse},
     queries::{
-        accounts::{sum_account_balances, AccountsStateQuery, AccountsStateQueryResponse},
-        governance::{GovernanceStateQuery, GovernanceStateQueryResponse},
+        accounts::{AccountsStateQuery, AccountsStateQueryResponse, DEFAULT_ACCOUNTS_QUERY_TOPIC},
+        get_query_topic,
+        governance::{
+            GovernanceStateQuery, GovernanceStateQueryResponse, DEFAULT_DREPS_QUERY_TOPIC,
+            DEFAULT_GOVERNANCE_QUERY_TOPIC,
+        },
     },
     Credential, GovActionId, Voter,
 };
@@ -11,12 +19,7 @@ use anyhow::Result;
 use caryatid_sdk::Context;
 use reqwest::Client;
 use serde_json::Value;
-use std::sync::Arc;
-
-use crate::types::{
-    DRepInfoREST, DRepMetadataREST, DRepUpdateREST, DRepVoteREST, DRepsListREST, ProposalVoteREST,
-    VoterRoleREST,
-};
+use std::{collections::HashMap, sync::Arc};
 
 pub async fn handle_dreps_list_blockfrost(
     context: Arc<Context<Message>>,
@@ -25,7 +28,9 @@ pub async fn handle_dreps_list_blockfrost(
     let msg = Arc::new(Message::StateQuery(StateQuery::Governance(
         GovernanceStateQuery::GetDRepsList,
     )));
-    let raw_msg = context.message_bus.request("drep-state", msg).await?;
+
+    let dreps_query_topic = get_query_topic(context.clone(), DEFAULT_DREPS_QUERY_TOPIC);
+    let raw_msg = context.message_bus.request(&dreps_query_topic, msg).await?;
     let message = Arc::try_unwrap(raw_msg).unwrap_or_else(|arc| (*arc).clone());
     match message {
         Message::StateQueryResponse(StateQueryResponse::Governance(
@@ -87,7 +92,8 @@ pub async fn handle_single_drep_blockfrost(
         },
     )));
 
-    let raw_msg = context.message_bus.request("drep-state", msg).await?;
+    let drep_query_topic = get_query_topic(context.clone(), DEFAULT_DREPS_QUERY_TOPIC);
+    let raw_msg = context.message_bus.request(&drep_query_topic, msg).await?;
     let message = Arc::try_unwrap(raw_msg).unwrap_or_else(|arc| (*arc).clone());
 
     match message {
@@ -95,15 +101,47 @@ pub async fn handle_single_drep_blockfrost(
             GovernanceStateQueryResponse::DRepInfoWithDelegators(response),
         )) => {
             let active = !response.info.retired && !response.info.expired;
-            let amount = match sum_account_balances(context.clone(), &response.delegators).await {
-                Ok(total) => (total + response.info.deposit).to_string(),
-                Err(e) => {
+
+            let accounts = response
+                .delegators
+                .iter()
+                .map(|addr| addr.get_hash()) // or `get_hash()` if using StakeCredential
+                .collect();
+
+            let sum_msg = Arc::new(Message::StateQuery(StateQuery::Accounts(
+                AccountsStateQuery::GetAccountsBalancesSum {
+                    stake_keys: accounts,
+                },
+            )));
+
+            let accounts_query_topic =
+                get_query_topic(context.clone(), DEFAULT_ACCOUNTS_QUERY_TOPIC);
+            let raw_sum = context.message_bus.request(&accounts_query_topic, sum_msg).await?;
+            let sum_response = Arc::try_unwrap(raw_sum).unwrap_or_else(|arc| (*arc).clone());
+
+            let sum = match sum_response {
+                Message::StateQueryResponse(StateQueryResponse::Accounts(
+                    AccountsStateQueryResponse::AccountsBalancesSum(sum),
+                )) => sum,
+
+                Message::StateQueryResponse(StateQueryResponse::Accounts(
+                    AccountsStateQueryResponse::Error(e),
+                )) => {
                     return Ok(RESTResponse::with_text(
                         500,
                         &format!("Failed to sum balances: {e}"),
                     ));
                 }
+
+                _ => {
+                    return Ok(RESTResponse::with_text(
+                        500,
+                        "Unexpected response from accounts-state",
+                    ));
+                }
             };
+
+            let amount = (sum + response.info.deposit).to_string();
 
             let response = DRepInfoREST {
                 drep_id: drep_id.to_string(),
@@ -131,11 +169,8 @@ pub async fn handle_single_drep_blockfrost(
         )) => Ok(RESTResponse::with_text(404, "DRep not found")),
 
         Message::StateQueryResponse(StateQueryResponse::Governance(
-            GovernanceStateQueryResponse::Error(_),
-        )) => Ok(RESTResponse::with_text(
-            500,
-            &format!("DRep info storage is disabled in config"),
-        )),
+            GovernanceStateQueryResponse::Error(e),
+        )) => Ok(RESTResponse::with_text(500, &format!("{e}"))),
 
         _ => Ok(RESTResponse::with_text(500, "Unexpected message type")),
     }
@@ -149,14 +184,9 @@ pub async fn handle_drep_delegators_blockfrost(
         return Ok(RESTResponse::with_text(400, "Missing DRep ID parameter"));
     };
 
-    let credential = match Credential::from_drep_bech32(drep_id) {
+    let credential = match parse_drep_credential(drep_id) {
         Ok(c) => c,
-        Err(e) => {
-            return Ok(RESTResponse::with_text(
-                400,
-                &format!("Invalid Bech32 DRep ID: {drep_id}. Error: {e}"),
-            ));
-        }
+        Err(resp) => return Ok(resp),
     };
 
     let msg = Arc::new(Message::StateQuery(StateQuery::Governance(
@@ -165,16 +195,18 @@ pub async fn handle_drep_delegators_blockfrost(
         },
     )));
 
-    let raw_msg = context.message_bus.request("drep-state", msg).await?;
+    let drep_query_topic = get_query_topic(context.clone(), DEFAULT_DREPS_QUERY_TOPIC);
+    let raw_msg = context.message_bus.request(&drep_query_topic, msg).await?;
     let message = Arc::try_unwrap(raw_msg).unwrap_or_else(|arc| (*arc).clone());
 
     match message {
         Message::StateQueryResponse(StateQueryResponse::Governance(
             GovernanceStateQueryResponse::DRepDelegators(delegators),
         )) => {
-            let mut response = Vec::new();
+            let mut stake_keys = Vec::new();
+            let mut stake_key_to_bech32 = HashMap::new();
 
-            for addr in delegators.addresses.iter() {
+            for addr in &delegators.addresses {
                 let bech32 = match addr.to_stake_bech32() {
                     Ok(b) => b,
                     Err(_) => {
@@ -185,40 +217,59 @@ pub async fn handle_drep_delegators_blockfrost(
                     }
                 };
 
-                let msg = Arc::new(Message::StateQuery(StateQuery::Accounts(
-                    AccountsStateQuery::GetAccountBalance {
-                        stake_key: addr.get_hash(),
-                    },
-                )));
-
-                let raw_msg = context.message_bus.request("accounts-state", msg).await;
-                match raw_msg {
-                    Ok(raw_msg) => {
-                        let msg = Arc::try_unwrap(raw_msg).unwrap_or_else(|arc| (*arc).clone());
-                        if let Message::StateQueryResponse(StateQueryResponse::Accounts(
-                            AccountsStateQueryResponse::AccountBalance(amount),
-                        )) = msg
-                        {
-                            response.push(serde_json::json!({
-                                "address": bech32,
-                                "amount": amount.to_string(),
-                            }));
-                        }
-                    }
-                    Err(e) => {
-                        return Ok(RESTResponse::with_text(
-                            500,
-                            &format!("Failed to get balance for {bech32}: {e}"),
-                        ));
-                    }
-                }
+                let hash = addr.get_hash();
+                stake_keys.push(hash.clone());
+                stake_key_to_bech32.insert(hash, bech32);
             }
 
-            match serde_json::to_string_pretty(&response) {
-                Ok(json) => Ok(RESTResponse::with_json(200, &json)),
-                Err(e) => Ok(RESTResponse::with_text(
+            let msg = Arc::new(Message::StateQuery(StateQuery::Accounts(
+                AccountsStateQuery::GetAccountsBalancesMap { stake_keys },
+            )));
+
+            let accounts_query_topic =
+                get_query_topic(context.clone(), DEFAULT_ACCOUNTS_QUERY_TOPIC);
+            let raw_msg = context.message_bus.request(&accounts_query_topic, msg).await?;
+            let message = Arc::try_unwrap(raw_msg).unwrap_or_else(|arc| (*arc).clone());
+
+            match message {
+                Message::StateQueryResponse(StateQueryResponse::Accounts(
+                    AccountsStateQueryResponse::AccountsBalancesMap(map),
+                )) => {
+                    let mut response = Vec::new();
+
+                    for (key, amount) in map {
+                        let Some(bech32) = stake_key_to_bech32.get(&key) else {
+                            return Ok(RESTResponse::with_text(
+                                500,
+                                "Internal error: missing Bech32 for stake key",
+                            ));
+                        };
+
+                        response.push(serde_json::json!({
+                            "address": bech32,
+                            "amount": amount.to_string(),
+                        }));
+                    }
+
+                    match serde_json::to_string_pretty(&response) {
+                        Ok(json) => Ok(RESTResponse::with_json(200, &json)),
+                        Err(e) => Ok(RESTResponse::with_text(
+                            500,
+                            &format!("Failed to serialize DRep delegators: {e}"),
+                        )),
+                    }
+                }
+
+                Message::StateQueryResponse(StateQueryResponse::Accounts(
+                    AccountsStateQueryResponse::Error(e),
+                )) => Ok(RESTResponse::with_text(
                     500,
-                    &format!("Failed to serialize DRep delegators: {e}"),
+                    &format!("Account state error: {e}"),
+                )),
+
+                _ => Ok(RESTResponse::with_text(
+                    500,
+                    "Unexpected response from accounts-state",
                 )),
             }
         }
@@ -246,14 +297,9 @@ pub async fn handle_drep_metadata_blockfrost(
         return Ok(RESTResponse::with_text(400, "Missing DRep ID parameter"));
     };
 
-    let credential = match Credential::from_drep_bech32(drep_id) {
+    let credential = match parse_drep_credential(drep_id) {
         Ok(c) => c,
-        Err(e) => {
-            return Ok(RESTResponse::with_text(
-                400,
-                &format!("Invalid Bech32 DRep ID: {drep_id}. Error: {e}"),
-            ));
-        }
+        Err(resp) => return Ok(resp),
     };
 
     let msg = Arc::new(Message::StateQuery(StateQuery::Governance(
@@ -262,7 +308,8 @@ pub async fn handle_drep_metadata_blockfrost(
         },
     )));
 
-    let raw_msg = context.message_bus.request("drep-state", msg).await?;
+    let drep_query_topic = get_query_topic(context.clone(), DEFAULT_DREPS_QUERY_TOPIC);
+    let raw_msg = context.message_bus.request(&drep_query_topic, msg).await?;
     let message = Arc::try_unwrap(raw_msg).unwrap_or_else(|arc| (*arc).clone());
 
     match message {
@@ -336,14 +383,9 @@ pub async fn handle_drep_updates_blockfrost(
         return Ok(RESTResponse::with_text(400, "Missing DRep ID parameter"));
     };
 
-    let credential = match Credential::from_drep_bech32(drep_id) {
+    let credential = match parse_drep_credential(drep_id) {
         Ok(c) => c,
-        Err(e) => {
-            return Ok(RESTResponse::with_text(
-                400,
-                &format!("Invalid Bech32 DRep ID: {drep_id}. Error: {e}"),
-            ));
-        }
+        Err(resp) => return Ok(resp),
     };
 
     let msg = Arc::new(Message::StateQuery(StateQuery::Governance(
@@ -352,7 +394,8 @@ pub async fn handle_drep_updates_blockfrost(
         },
     )));
 
-    let raw_msg = context.message_bus.request("drep-state", msg).await?;
+    let drep_query_topic = get_query_topic(context.clone(), DEFAULT_DREPS_QUERY_TOPIC);
+    let raw_msg = context.message_bus.request(&drep_query_topic, msg).await?;
     let message = Arc::try_unwrap(raw_msg).unwrap_or_else(|arc| (*arc).clone());
 
     match message {
@@ -401,14 +444,9 @@ pub async fn handle_drep_votes_blockfrost(
         return Ok(RESTResponse::with_text(400, "Missing DRep ID parameter"));
     };
 
-    let credential = match Credential::from_drep_bech32(drep_id) {
+    let credential = match parse_drep_credential(drep_id) {
         Ok(c) => c,
-        Err(e) => {
-            return Ok(RESTResponse::with_text(
-                400,
-                &format!("Invalid Bech32 DRep ID: {drep_id}. Error: {e}"),
-            ));
-        }
+        Err(resp) => return Ok(resp),
     };
 
     let msg = Arc::new(Message::StateQuery(StateQuery::Governance(
@@ -417,7 +455,8 @@ pub async fn handle_drep_votes_blockfrost(
         },
     )));
 
-    let raw_msg = context.message_bus.request("drep-state", msg).await?;
+    let drep_query_topic = get_query_topic(context.clone(), DEFAULT_DREPS_QUERY_TOPIC);
+    let raw_msg = context.message_bus.request(&drep_query_topic, msg).await?;
     let message = Arc::try_unwrap(raw_msg).unwrap_or_else(|arc| (*arc).clone());
     match message {
         Message::StateQueryResponse(StateQueryResponse::Governance(
@@ -465,7 +504,8 @@ pub async fn handle_proposals_list_blockfrost(
         GovernanceStateQuery::GetProposalsList,
     )));
 
-    let raw_msg = context.message_bus.request("governance-state", msg).await?;
+    let governance_query_topic = get_query_topic(context.clone(), DEFAULT_GOVERNANCE_QUERY_TOPIC);
+    let raw_msg = context.message_bus.request(&governance_query_topic, msg).await?;
     let message = Arc::try_unwrap(raw_msg).unwrap_or_else(|arc| (*arc).clone());
 
     match message {
@@ -518,7 +558,9 @@ pub async fn handle_single_proposal_blockfrost(
     let msg = Arc::new(Message::StateQuery(StateQuery::Governance(
         GovernanceStateQuery::GetProposalInfo { proposal },
     )));
-    let raw_msg = context.message_bus.request("governance-state", msg).await?;
+
+    let governance_query_topic = get_query_topic(context.clone(), DEFAULT_GOVERNANCE_QUERY_TOPIC);
+    let raw_msg = context.message_bus.request(&governance_query_topic, msg).await?;
     let message = Arc::try_unwrap(raw_msg).unwrap_or_else(|arc| (*arc).clone());
 
     match message {
@@ -574,7 +616,8 @@ pub async fn handle_proposal_votes_blockfrost(
         GovernanceStateQuery::GetProposalVotes { proposal },
     )));
 
-    let raw_msg = context.message_bus.request("governance-state", msg).await?;
+    let governance_query_topic = get_query_topic(context.clone(), DEFAULT_GOVERNANCE_QUERY_TOPIC);
+    let raw_msg = context.message_bus.request(&governance_query_topic, msg).await?;
     let message = Arc::try_unwrap(raw_msg).unwrap_or_else(|arc| (*arc).clone());
 
     match message {
@@ -667,4 +710,13 @@ pub fn parse_gov_action_id(params: &[String]) -> Result<Result<GovActionId, REST
         transaction_id,
         action_index,
     }))
+}
+
+fn parse_drep_credential(drep_id: &str) -> Result<Credential, RESTResponse> {
+    Credential::from_drep_bech32(drep_id).map_err(|e| {
+        RESTResponse::with_text(
+            400,
+            &format!("Invalid Bech32 DRep ID: {drep_id}. Error: {e}"),
+        )
+    })
 }

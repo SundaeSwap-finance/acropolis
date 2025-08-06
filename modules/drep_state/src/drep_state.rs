@@ -32,6 +32,8 @@ const DEFAULT_STORE_METADATA: (&str, bool) = ("store-metadata", false);
 const DEFAULT_STORE_UPDATES: (&str, bool) = ("store-updates", false);
 const DEFAULT_STORE_VOTES: (&str, bool) = ("store-votes", false);
 
+const DEFAULT_DREPS_QUERY_TOPIC: (&str, &str) = ("dreps-state-query-topic", "cardano.query.dreps");
+
 /// DRep State module
 #[module(
     message_type(Message),
@@ -58,6 +60,9 @@ impl DRepState {
 
         let drep_state_topic = get_string(&config, DEFAULT_DREP_STATE_TOPIC);
         info!("Creating DRep state publisher on '{drep_state_topic}'");
+
+        let drep_query_topic = get_string(&config, DEFAULT_DREPS_QUERY_TOPIC);
+        info!("Creating DRep query publisher on '{drep_query_topic}'");
 
         let storage_config = DRepStorageConfig {
             store_info: get_flag(&config, DEFAULT_STORE_INFO),
@@ -157,7 +162,7 @@ impl DRepState {
         }
 
         let query_state = state.clone();
-        context.handle("drep-state", move |message| {
+        context.handle(&drep_query_topic, move |message| {
             let state_handle = query_state.clone();
             async move {
                 let Message::StateQuery(StateQuery::Governance(query)) = message.as_ref() else {

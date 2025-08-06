@@ -1,11 +1,9 @@
-use std::sync::Arc;
+use std::collections::HashMap;
 
-use caryatid_sdk::Context;
+use crate::{DRepChoice, KeyHash};
 
-use crate::{
-    messages::{Message, StateQuery, StateQueryResponse},
-    DRepChoice, KeyHash, StakeCredential,
-};
+pub const DEFAULT_ACCOUNTS_QUERY_TOPIC: (&str, &str) =
+    ("accounts-state-query-topic", "cardano.query.accounts");
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub enum AccountsStateQuery {
@@ -13,6 +11,7 @@ pub enum AccountsStateQuery {
     GetAccountRewardHistory { stake_key: Vec<u8> },
     GetAccountHistory { stake_key: Vec<u8> },
     GetAccountDelegationHistory { stake_key: Vec<u8> },
+    GetAccountsDrepDelegationsMap { stake_keys: Vec<Vec<u8>> },
     GetAccountRegistrationHistory { stake_key: Vec<u8> },
     GetAccountWithdrawalHistory { stake_key: Vec<u8> },
     GetAccountMIRHistory { stake_key: Vec<u8> },
@@ -20,7 +19,8 @@ pub enum AccountsStateQuery {
     GetAccountAssets { stake_key: Vec<u8> },
     GetAccountAssetsTotals { stake_key: Vec<u8> },
     GetAccountUTxOs { stake_key: Vec<u8> },
-    GetAccountBalance { stake_key: Vec<u8> },
+    GetAccountsBalancesMap { stake_keys: Vec<Vec<u8>> },
+    GetAccountsBalancesSum { stake_keys: Vec<Vec<u8>> },
     GetAccountDRepDelegation { stake_key: Vec<u8> },
 }
 
@@ -30,6 +30,7 @@ pub enum AccountsStateQueryResponse {
     AccountRewardHistory(AccountRewardHistory),
     AccountHistory(AccountHistory),
     AccountDelegationHistory(AccountDelegationHistory),
+    AccountsDrepDelegationsMap(HashMap<Vec<u8>, Option<DRepChoice>>),
     AccountRegistrationHistory(AccountRegistrationHistory),
     AccountWithdrawalHistory(AccountWithdrawalHistory),
     AccountMIRHistory(AccountMIRHistory),
@@ -37,7 +38,8 @@ pub enum AccountsStateQueryResponse {
     AccountAssets(AccountAssets),
     AccountAssetsTotals(AccountAssetsTotals),
     AccountUTxOs(AccountUTxOs),
-    AccountBalance(u64),
+    AccountsBalancesMap(HashMap<Vec<u8>, u64>),
+    AccountsBalancesSum(u64),
     AccountDRepDelegation(Option<DRepChoice>),
     NotFound,
     Error(String),
@@ -80,39 +82,3 @@ pub struct AccountAssetsTotals {}
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct AccountUTxOs {}
-
-pub async fn sum_account_balances(
-    context: Arc<Context<Message>>,
-    stake_credentials: &[StakeCredential],
-) -> Result<u64, String> {
-    let mut total: u64 = 0;
-
-    for cred in stake_credentials.iter() {
-        let msg = Arc::new(Message::StateQuery(StateQuery::Accounts(
-            AccountsStateQuery::GetAccountBalance {
-                stake_key: cred.get_hash(),
-            },
-        )));
-
-        match context.message_bus.request("accounts-state", msg).await {
-            Ok(raw) => match Arc::try_unwrap(raw).unwrap_or_else(|arc| (*arc).clone()) {
-                Message::StateQueryResponse(StateQueryResponse::Accounts(
-                    AccountsStateQueryResponse::AccountBalance(amount),
-                )) => {
-                    total = total.saturating_add(amount);
-                }
-                other => {
-                    return Err(format!(
-                        "Unexpected accounts-state response for {:?}: {:?}",
-                        cred, other
-                    ));
-                }
-            },
-            Err(e) => {
-                return Err(format!("Failed to query balance for {:?}: {}", cred, e));
-            }
-        }
-    }
-
-    Ok(total)
-}

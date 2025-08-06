@@ -67,6 +67,7 @@ pub struct ProposalsListREST {
     pub governance_type: ProposalTypeREST,
 }
 
+#[allow(dead_code)]
 #[derive(Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ProposalTypeREST {
