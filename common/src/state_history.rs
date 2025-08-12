@@ -89,3 +89,17 @@ impl<S: Clone + Default> StateHistory<S> {
         });
     }
 }
+
+/// Helper that lets callers initialize the first state with custom config.
+impl<S: Clone> StateHistory<S> {
+    pub fn get_or_init_with<F>(&mut self, init: F) -> S
+    where
+        F: FnOnce() -> S,
+    {
+        if let Some(entry) = self.history.back() {
+            entry.state.clone()
+        } else {
+            init()
+        }
+    }
+}
