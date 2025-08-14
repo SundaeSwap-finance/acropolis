@@ -8,19 +8,21 @@ use acropolis_common::{
         DRepVotes, DRepsList, GovernanceStateQuery, GovernanceStateQueryResponse,
     },
     state_history::StateHistory,
-    BlockStatus,
+    BlockInfo, BlockStatus,
 };
+use anyhow::anyhow;
 use anyhow::Result;
-use caryatid_sdk::{module, Context, Module};
+use caryatid_sdk::{module, Context, Module, Subscription};
 use config::Config;
-use std::sync::Arc;
-use tokio::sync::{mpsc, Mutex};
-use tracing::{error, info, info_span, Instrument};
-
+use std::{collections::BTreeMap, sync::Arc, time::Duration};
+use tokio::{
+    sync::{mpsc, Mutex},
+    time::timeout,
+};
+use tracing::{debug, error, info, info_span, Instrument};
 mod state;
-use state::State;
-
 use crate::state::DRepStorageConfig;
+use state::State;
 
 const DEFAULT_CERTIFICATES_SUBSCRIBE_TOPIC: (&str, &str) =
     ("certificates-subscribe-topic", "cardano.certificates");
@@ -46,6 +48,12 @@ const DEFAULT_DREPS_QUERY_TOPIC: (&str, &str) = ("dreps-state-query-topic", "car
 )]
 
 pub struct DRepState;
+
+struct Pair {
+    bi: BlockInfo,
+    certs: Option<acropolis_common::messages::TxCertificatesMessage>,
+    gov: Option<acropolis_common::messages::GovernanceProceduresMessage>,
+}
 
 impl DRepState {
     pub async fn init(&self, context: Arc<Context<Message>>, config: Arc<Config>) -> Result<()> {
@@ -82,7 +90,6 @@ impl DRepState {
             governance_subscribe_topic = get_string(&config, DEFAULT_GOVERNANCE_SUBSCRIBE_TOPIC);
             info!("Creating subscriber on '{governance_subscribe_topic}'");
         }
-
         let mut parameters_subscribe_topic = String::new();
         if storage_config.store_info {
             parameters_subscribe_topic = get_string(&config, DEFAULT_PARAMETERS_SUBSCRIBE_TOPIC);
@@ -92,55 +99,22 @@ impl DRepState {
         let history = Arc::new(Mutex::new(StateHistory::<State>::new("DRepState")));
 
         // Subscriptions
-        let mut certs_subscription = context.subscribe(&certificates_subscribe_topic).await?;
-        let mut votes_subscription = if storage_config.store_votes {
-            Some(context.subscribe(&governance_subscribe_topic).await?)
-        } else {
-            None
-        };
-        let mut parameters_subscription = if storage_config.store_info {
-            Some(context.subscribe(&parameters_subscribe_topic).await?)
-        } else {
-            None
-        };
+        let certs_subscription: Box<dyn Subscription<Message> + Send> =
+            context.subscribe(&certificates_subscribe_topic).await?;
 
-        let (vote_tx, mut vote_rx) = mpsc::channel::<Arc<Message>>(256);
-        if let Some(mut sub) = votes_subscription.take() {
-            let tx = vote_tx.clone();
-            let ctx = context.clone();
-            ctx.run(async move {
-                loop {
-                    match sub.read().await {
-                        Ok((_, msg)) => {
-                            let _ = tx.send(msg).await;
-                        }
-                        Err(e) => {
-                            tracing::warn!("votes subscription ended: {e}");
-                            break;
-                        }
-                    }
-                }
-            });
-        }
+        let mut gov_subscription: Option<Box<dyn Subscription<Message> + Send>> =
+            if storage_config.store_votes {
+                Some(context.subscribe(&governance_subscribe_topic).await?)
+            } else {
+                None
+            };
 
-        let (param_tx, mut param_rx) = mpsc::channel::<Arc<Message>>(64);
-        if let Some(mut sub) = parameters_subscription.take() {
-            let tx = param_tx.clone();
-            let ctx = context.clone();
-            ctx.run(async move {
-                loop {
-                    match sub.read().await {
-                        Ok((_, msg)) => {
-                            let _ = tx.send(msg).await;
-                        }
-                        Err(e) => {
-                            tracing::warn!("params subscription ended: {e}");
-                            break;
-                        }
-                    }
-                }
-            });
-        }
+        let mut parameters_subscription: Option<Box<dyn Subscription<Message> + Send>> =
+            if storage_config.store_info || storage_config.store_votes {
+                Some(context.subscribe(&parameters_subscribe_topic).await?)
+            } else {
+                None
+            };
 
         // Main loop of synchronised messages
         let context_subscribe = context.clone();
@@ -149,135 +123,69 @@ impl DRepState {
         let drep_state_topic = drep_state_topic.clone();
         let init_cfg = storage_config;
 
+        // Subscribe to certificates and governance messages in separate tasks
+        // This keeps bus reads running at full speed and prevents one stream
+        // from blocking the other. Messages are forwarded into tx_certs and tx_gov channels.
+        let (mut rx_certs, mut rx_gov) =
+            spawn_subscription_forwarders(certs_subscription, gov_subscription.take());
+
         context.run(async move {
-            use std::cmp::Ordering;
-            use std::collections::BTreeMap;
+            // Conway epoch start, set when Conway params are seen.
+            // Used to determine when to start processing votes.
+            let mut conway_epoch_start: Option<u64> = None;
 
-            let mut vote_buf: BTreeMap<u64, Vec<Arc<Message>>> = BTreeMap::new();
-            let mut params_buf: BTreeMap<u64, (u64, u32)> = BTreeMap::new();
+            // Pending blocks to process. Once conway_epoch_start is set,
+            // we wait for matching cert and gov messages before processing a block.
+            let mut pending: BTreeMap<u64, Pair> = BTreeMap::new();
 
+            // Last committed block number used to avoid reprocessing.
+            let mut last_committed: u64 = 0;
             loop {
-                // state snapshot (cloned) to work on
-                let mut state = {
-                    let mut h = history_handler.lock().await;
-                    h.get_or_init_with(|| State::new(init_cfg))
-                };
+                // Drain certificate and governance messages from forwarder to pending
+                // If no new messages, we block until new messages arrive.
+                let new_messages = drain_cert_messages(
+                    &mut rx_certs,
+                    &mut pending,
+                    &history_handler,
+                    &mut last_committed,
+                    &mut conway_epoch_start,
+                )
+                .await
+                    || drain_gov_messages(
+                        &mut rx_gov,
+                        &mut pending,
+                        &history_handler,
+                        &mut last_committed,
+                        &mut conway_epoch_start,
+                    )
+                    .await;
 
-                // Anchor on certificates (blocking read)
-                let Ok((_, certs_msg)) = certs_subscription.read().await else {
-                    return;
-                };
-                let (block_info, tx_certs) = match certs_msg.as_ref() {
-                    Message::Cardano((bi, CardanoMessage::TxCertificates(txcs))) => {
-                        (bi.clone(), txcs)
-                    }
-                    _ => {
-                        error!("Unexpected message on certificates: {certs_msg:?}");
-                        continue;
-                    }
-                };
-
-                if block_info.status == BlockStatus::RolledBack {
-                    state = history_handler.lock().await.get_rolled_back_state(&block_info);
-                    vote_buf.retain(|num, _| *num < block_info.number);
-                    params_buf.retain(|_, (param_block, _)| *param_block < block_info.number);
-                }
-                let new_epoch = block_info.new_epoch && block_info.epoch > 0;
-
-                // ---- Drain votes channel (non-blocking) and handle/buffer by block ----
-                while let Ok(msg) = vote_rx.try_recv() {
-                    if let Message::Cardano((bi, CardanoMessage::GovernanceProcedures(gp))) =
-                        msg.as_ref()
-                    {
-                        match bi.number.cmp(&block_info.number) {
-                            Ordering::Equal => {
-                                if let Err(e) = state.handle_votes(gp).await {
-                                    error!("Failed to handle governance procedures: {e}");
-                                }
-                            }
-                            Ordering::Greater => {
-                                vote_buf.entry(bi.number).or_default().push(msg.clone());
-                            }
-                            Ordering::Less => {
-                                tracing::debug!("Stale governance msg for block {}", bi.number);
-                            }
-                        }
-                    } else {
-                        error!("Unexpected governance message: {msg:?}");
-                    }
-                }
-                // Also apply any votes we buffered for this block (if they arrived earlier)
-                if let Some(pending) = vote_buf.remove(&block_info.number) {
-                    for msg in pending {
-                        if let Message::Cardano((_bi, CardanoMessage::GovernanceProcedures(gp))) =
-                            msg.as_ref()
-                        {
-                            if let Err(e) = state.handle_votes(gp).await {
-                                error!("Failed to handle buffered governance procedures: {e}");
-                            }
-                        }
-                    }
+                // If no messages were drained, wait for new messages
+                if !new_messages {
+                    wait_for_new_message(
+                        &mut pending,
+                        &mut rx_certs,
+                        &mut rx_gov,
+                        &init_cfg,
+                        &conway_epoch_start,
+                    )
+                    .await;
+                    continue;
                 }
 
-                // Always drain params channel; store the epoch and the block they apply from
-                while let Ok(msg) = param_rx.try_recv() {
-                    if let Message::Cardano((bi, CardanoMessage::ProtocolParams(pp))) = msg.as_ref()
-                    {
-                        if let Some(conway) = &pp.params.conway {
-                            params_buf.insert(bi.epoch, (bi.number, conway.d_rep_activity));
-                        } else {
-                            tracing::debug!(
-                                "ProtocolParams without Conway (epoch {}, block {})",
-                                bi.epoch,
-                                bi.number
-                            );
-                        }
-                    } else {
-                        error!("Unexpected parameters message: {msg:?}");
-                    }
-                }
-
-                // Apply once we reach or pass the block that emitted the params for this epoch
-                if let Some(&(param_block, activity)) = params_buf.get(&block_info.epoch) {
-                    if block_info.number >= param_block {
-                        if let Err(err) = state.update_drep_expirations(block_info.epoch, activity)
-                        {
-                            error!("Failed to update DRep expirations: {err}");
-                        }
-                        params_buf.remove(&block_info.epoch);
-                    }
-                }
-
-                // ---- Certificates last (same as before) ----
-                if let Err(e) = state.handle_certificates(context_handler.clone(), tx_certs).await {
-                    error!("Certificates handling error: {e}");
-                }
-
-                // Commit the new state snapshot
-                {
-                    let mut h = history_handler.lock().await;
-                    h.commit(&block_info, state);
-                }
-
-                // Publish epoch snapshot
-                if new_epoch && block_info.epoch > 0 {
-                    let dreps = {
-                        let mut h = history_handler.lock().await;
-                        h.get_current_state().active_drep_list()
-                    };
-                    let out = Message::Cardano((
-                        block_info.clone(),
-                        CardanoMessage::DRepState(DRepStateMessage {
-                            epoch: block_info.epoch,
-                            dreps,
-                        }),
-                    ));
-                    if let Err(e) =
-                        context_subscribe.publish(&drep_state_topic, Arc::new(out)).await
-                    {
-                        error!("Failed to publish DRep state: {e}");
-                    }
-                }
+                // Process blocks that have both certs and gov messages ready sequentially by block number
+                process_ready_blocks(
+                    &mut pending,
+                    &init_cfg,
+                    &mut conway_epoch_start,
+                    &mut last_committed,
+                    &history_handler,
+                    &mut parameters_subscription,
+                    &context_handler,
+                    &context_subscribe,
+                    &drep_state_topic,
+                )
+                .await;
             }
         });
 
@@ -432,7 +340,7 @@ impl DRepState {
                                 h.get_current_state()
                             };
 
-                            snapshot.tick().await.inspect_err(|e| error!("Tick error: {e}")).ok();
+                            snapshot.tick().inspect_err(|e| error!("Tick error: {e}")).ok();
                         }
                         .instrument(span)
                         .await;
@@ -442,5 +350,320 @@ impl DRepState {
         });
 
         Ok(())
+    }
+}
+
+fn spawn_subscription_forwarders(
+    mut certs_subscription: Box<dyn Subscription<Message> + Send>,
+    gov_subscription: Option<Box<dyn Subscription<Message> + Send>>,
+) -> (
+    mpsc::UnboundedReceiver<Arc<Message>>,
+    mpsc::UnboundedReceiver<Arc<Message>>,
+) {
+    let (tx_certs, rx_certs) = mpsc::unbounded_channel();
+    let (tx_gov, rx_gov) = mpsc::unbounded_channel();
+
+    // Certificates forwarder
+    tokio::spawn(async move {
+        while let Ok((_, msg)) = certs_subscription.read().await {
+            if tx_certs.send(msg).is_err() {
+                break;
+            }
+        }
+    });
+
+    // Governance forwarder
+    if let Some(mut sub) = gov_subscription {
+        tokio::spawn(async move {
+            while let Ok((_, msg)) = sub.read().await {
+                let _ = tx_gov.send(msg);
+            }
+        });
+    }
+
+    (rx_certs, rx_gov)
+}
+
+async fn drain_cert_messages(
+    rx_certs: &mut mpsc::UnboundedReceiver<Arc<Message>>,
+    pending: &mut BTreeMap<u64, Pair>,
+    history_handler: &Arc<Mutex<StateHistory<State>>>,
+    last_committed: &mut u64,
+    conway_epoch_start: &mut Option<u64>,
+) -> bool {
+    let mut progressed = false;
+
+    while let Ok(msg) = rx_certs.try_recv() {
+        progressed = true;
+        if let Message::Cardano((bi, CardanoMessage::TxCertificates(certs))) = msg.as_ref() {
+            // Ensure we don't reprocess blocks
+            if bi.number <= *last_committed {
+                continue;
+            }
+
+            // Check for roll back
+            if bi.status == BlockStatus::RolledBack {
+                // Get rolled back state
+                let new_state = {
+                    let mut h = history_handler.lock().await;
+                    h.get_rolled_back_state(bi)
+                };
+
+                // Clear pending >= this block
+                pending.split_off(&bi.number);
+
+                // Commit rolled back state
+                {
+                    let mut h = history_handler.lock().await;
+                    h.commit(bi, new_state);
+                }
+
+                // Check if rollback occured over conway epoch start, rollback flag to None.
+                if let Some(start) = *conway_epoch_start {
+                    if bi.epoch <= start {
+                        *conway_epoch_start = None;
+                    }
+                }
+            } else {
+                // No rollback, store certificate message in pending
+                pending
+                    .entry(bi.number)
+                    .or_insert_with(|| Pair {
+                        bi: bi.clone(),
+                        certs: None,
+                        gov: None,
+                    })
+                    .certs = Some(certs.clone());
+            }
+        }
+    }
+
+    progressed
+}
+
+async fn drain_gov_messages(
+    rx_gov: &mut mpsc::UnboundedReceiver<Arc<Message>>,
+    pending: &mut BTreeMap<u64, Pair>,
+    history_handler: &Arc<Mutex<StateHistory<State>>>,
+    last_committed: &mut u64,
+    conway_epoch_start: &mut Option<u64>,
+) -> bool {
+    let mut progressed = false;
+
+    while let Ok(msg) = rx_gov.try_recv() {
+        progressed = true;
+        if let Message::Cardano((bi, CardanoMessage::GovernanceProcedures(gp))) = msg.as_ref() {
+            // Ensure we don't reprocess blocks
+            if bi.number <= *last_committed {
+                continue;
+            }
+
+            // Check for roll back
+            if bi.status == BlockStatus::RolledBack {
+                // Get rolled back state
+                let new_state = {
+                    let mut h = history_handler.lock().await;
+                    h.get_rolled_back_state(bi)
+                };
+
+                // Clear pending >= this block
+                pending.split_off(&bi.number);
+
+                // Commit rolled back state
+                {
+                    let mut h = history_handler.lock().await;
+                    h.commit(bi, new_state);
+                }
+
+                // Rollback last committed block
+                *last_committed = bi.number;
+
+                // Check if rollback occured over conway epoch start, rollback flag to None.
+                if let Some(start) = *conway_epoch_start {
+                    if bi.epoch <= start {
+                        *conway_epoch_start = None;
+                    }
+                }
+            } else {
+                // No rollback, store governance message in pending
+                pending
+                    .entry(bi.number)
+                    .or_insert_with(|| Pair {
+                        bi: bi.clone(),
+                        certs: None,
+                        gov: None,
+                    })
+                    .gov = Some(gp.clone());
+            }
+        }
+    }
+
+    progressed
+}
+
+async fn wait_for_new_message(
+    pending: &mut BTreeMap<u64, Pair>,
+    rx_certs: &mut mpsc::UnboundedReceiver<Arc<Message>>,
+    rx_gov: &mut mpsc::UnboundedReceiver<Arc<Message>>,
+    init_cfg: &DRepStorageConfig,
+    conway_epoch_start: &Option<u64>,
+) {
+    // Only listen for gov messages if store-votes is enabled, Conway era has started,
+    // and there are pending cert messages awaiting their gov partner.
+    let wait_for_gov = init_cfg.store_votes
+        && pending.values().any(|p| {
+            p.certs.is_some()
+                && p.gov.is_none()
+                && conway_epoch_start.map_or(false, |start| p.bi.epoch >= start)
+        });
+
+    // Wait for new messages to avoid busy waiting
+    tokio::select! {
+        // Always receive and store certificate messages
+        Some(msg) = rx_certs.recv() => {
+            if let Message::Cardano((bi, CardanoMessage::TxCertificates(certs))) = msg.as_ref() {
+                pending.entry(bi.number)
+                    .or_insert_with(|| Pair { bi: bi.clone(), certs: None, gov: None })
+                    .certs = Some(certs.clone());
+            }
+        }
+
+        // Only poll gov when a block is waiting for its gov partner.
+        Some(msg) = rx_gov.recv(), if wait_for_gov => {
+            if let Message::Cardano((bi, CardanoMessage::GovernanceProcedures(gp))) = msg.as_ref() {
+                pending.entry(bi.number)
+                    .or_insert_with(|| Pair { bi: bi.clone(), certs: None, gov: None })
+                    .gov = Some(gp.clone());
+            }
+        }
+    }
+}
+
+async fn process_ready_blocks(
+    pending: &mut BTreeMap<u64, Pair>,
+    init_cfg: &DRepStorageConfig,
+    conway_epoch_start: &mut Option<u64>,
+    last_committed: &mut u64,
+    history_handler: &Arc<Mutex<StateHistory<State>>>,
+    parameters_subscription: &mut Option<Box<dyn Subscription<Message> + Send>>,
+    context_handler: &Arc<Context<Message>>,
+    context_subscribe: &Arc<Context<Message>>,
+    drep_state_topic: &str,
+) {
+    // Process blocks that have both certs and gov messages ready sequentially by block number
+    while let Some((&k, p)) = pending.iter().next() {
+        // Check if governance certs are needed based on store-votes config and if conway has started.
+        let need_gov =
+            init_cfg.store_votes && conway_epoch_start.map_or(false, |start| p.bi.epoch >= start);
+
+        // Check if both cert and gov messages are ready for this block
+        let ready = p.certs.is_some() && (!need_gov || p.gov.is_some());
+
+        // If the oldest block is not ready, exit loop
+        if !ready {
+            break;
+        }
+
+        // Remove the block from pending for processing
+        let pair = pending.remove(&k).expect("exists");
+        let block_info = pair.bi.clone();
+
+        // Get the current state or initialize with config
+        let mut state = {
+            let mut h = history_handler.lock().await;
+            h.get_or_init_with(|| State::new(init_cfg.clone()))
+        };
+
+        // Check if we are at an epoch boundary
+        let new_epoch = block_info.new_epoch && block_info.epoch > 0;
+        if new_epoch {
+            // At epoch boundary, read parameters to check for Conway activation and retrieve
+            // DRep expiration parameter.
+            if let Some(sub) = parameters_subscription.as_mut() {
+                if let Ok(Ok((pblk, d_rep_activity))) =
+                    timeout(Duration::from_millis(50), read_parameters(sub)).await
+                {
+                    // Set conway_block_start if epoch transition to Conway is detected
+                    if conway_epoch_start.is_none() {
+                        *conway_epoch_start = Some(block_info.epoch);
+                        info!("Conway activated at epoch {}", block_info.epoch);
+                    }
+
+                    // Ensure parameters are for the correct block
+                    if pblk.number != block_info.number {
+                        error!(
+                            "Params out of sync: certs {} vs params {}",
+                            block_info.number, pblk.number
+                        );
+                    }
+
+                    // Update DRep expirations based on DRep expiration parameter
+                    if let Err(err) =
+                        state.update_drep_expirations(block_info.epoch, d_rep_activity)
+                    {
+                        error!("Failed to update DRep expirations: {err}");
+                    }
+                } else {
+                    debug!(
+                        "No params at epoch boundary {}, proceeding with previous era",
+                        block_info.epoch
+                    );
+                }
+            }
+
+            // Publish DRep state at epoch boundary
+            let dreps = {
+                let mut h = history_handler.lock().await;
+                h.get_current_state().active_drep_list()
+            };
+            let out = Message::Cardano((
+                block_info.clone(),
+                CardanoMessage::DRepState(DRepStateMessage {
+                    epoch: block_info.epoch,
+                    dreps,
+                }),
+            ));
+            if let Err(e) = context_subscribe.publish(&drep_state_topic, Arc::new(out)).await {
+                error!("Failed to publish DRep state: {e}");
+            }
+        }
+
+        // Process governance procedures if store-votes is enabled
+        if let Some(gp) = pair.gov.as_ref() {
+            if let Err(e) = state.process_votes(gp).await {
+                error!("Failed to handle governance procedures: {e}");
+            }
+        }
+
+        // Process certificates
+        if let Some(ref certs_msg) = pair.certs {
+            if let Err(e) = state.process_certificates(context_handler.clone(), certs_msg).await {
+                error!("Certificates handling error: {e}");
+            }
+        }
+
+        // Commit the updated state
+        {
+            let mut h = history_handler.lock().await;
+            h.commit(&block_info, state);
+        }
+
+        // Update the last committed block number
+        *last_committed = block_info.number;
+    }
+}
+
+pub async fn read_parameters(
+    sub: &mut Box<dyn Subscription<Message> + Send>,
+) -> Result<(BlockInfo, u32)> {
+    match sub.read().await?.1.as_ref() {
+        Message::Cardano((blk, CardanoMessage::ProtocolParams(params))) => {
+            if let Some(conway) = &params.params.conway {
+                Ok((blk.clone(), conway.d_rep_activity))
+            } else {
+                Err(anyhow!("ProtocolParams without Conway section"))
+            }
+        }
+        other => Err(anyhow!("Unexpected message on parameters topic: {other:?}")),
     }
 }

@@ -59,7 +59,9 @@ pub async fn main() -> Result<()> {
             .build()
             .tracer("rust-otel-otlp");
         let otel_layer = OpenTelemetryLayer::new(otel_tracer)
-            .with_filter(EnvFilter::from_default_env().add_directive(filter::LevelFilter::INFO.into()))
+            .with_filter(
+                EnvFilter::from_default_env().add_directive(filter::LevelFilter::INFO.into()),
+            )
             .with_filter(filter::filter_fn(|meta| meta.is_span()));
         Registry::default().with(fmt_layer).with(otel_layer).init();
     } else {
@@ -81,6 +83,7 @@ pub async fn main() -> Result<()> {
     let mut process = Process::<Message>::create(config).await;
 
     // Register modules
+    DRepState::register(&mut process);
     GenesisBootstrapper::register(&mut process);
     MithrilSnapshotFetcher::register(&mut process);
     UpstreamChainFetcher::register(&mut process);
@@ -88,7 +91,6 @@ pub async fn main() -> Result<()> {
     TxUnpacker::register(&mut process);
     UTXOState::register(&mut process);
     SPOState::register(&mut process);
-    DRepState::register(&mut process);
     GovernanceState::register(&mut process);
     ParametersState::register(&mut process);
     StakeDeltaFilter::register(&mut process);

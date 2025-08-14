@@ -8,7 +8,7 @@ genesis-key = "5b3139312c36362c3134302c3138352c3133382c31312c3233372c3230372c323
 # Download max age in hours. E.g. 8 means 8 hours (if there isn't any snapshot within this time range download from Mithril)
 download-max-age = "never"
 # Pause constraint E.g. "epoch:100", "block:1200"
-pause = "none"
+pause = "block:1"
 
 [module.upstream-chain-fetcher]
 sync-point = "snapshot"
@@ -34,15 +34,15 @@ address-delta-topic = "cardano.address.delta"
 
 [module.drep-state]
 # Enables /governance/dreps/{drep_id} endpoint (Requires store-delegators to be enabled)
-store-info = false
+store-info = true
 # Enables /governance/dreps/{drep_id}/delegators endpoint
-store-delegators = false
+store-delegators = true
 # Enables /governance/dreps/{drep_id}/metadata endpoint
-store-metadata = false
+store-metadata = true
 # Enables /governance/dreps/{drep_id}/updates endpoint
-store-updates = false
+store-updates = true
 # Enables /governance/dreps/{drep_id}/votes endpoint
-store-votes = false
+store-votes = true
 
 [module.governance-state]
 
