@@ -14,12 +14,9 @@ use anyhow::anyhow;
 use anyhow::Result;
 use caryatid_sdk::{module, Context, Module, Subscription};
 use config::Config;
-use std::{collections::BTreeMap, sync::Arc, time::Duration};
-use tokio::{
-    sync::{mpsc, Mutex},
-    time::timeout,
-};
-use tracing::{debug, error, info, info_span, Instrument};
+use std::{collections::BTreeMap, sync::Arc};
+use tokio::sync::{mpsc, Mutex};
+use tracing::{error, info, info_span, warn, Instrument};
 mod state;
 use crate::state::DRepStorageConfig;
 use state::State;
@@ -174,6 +171,8 @@ impl DRepState {
                 }
 
                 // Process blocks that have both certs and gov messages ready sequentially by block number
+                // TODO: Publish protocol params on epoch transition and block processing until params have been received
+                // to ensure Conway activation at correct block and avoid skipping any valid gov messages
                 process_ready_blocks(
                     &mut pending,
                     &init_cfg,
@@ -517,6 +516,19 @@ async fn wait_for_new_message(
                 && conway_epoch_start.map_or(false, |start| p.bi.epoch >= start)
         });
 
+    if wait_for_gov {
+        info!(
+            "Waiting for governance message for block(s): {:?}",
+            pending
+                .iter()
+                .filter(|(_, p)| p.certs.is_some() && p.gov.is_none())
+                .map(|(bn, _)| *bn)
+                .collect::<Vec<_>>()
+        );
+    } else {
+        info!("Waiting for certificate message");
+    }
+
     // Wait for new messages to avoid busy waiting
     tokio::select! {
         // Always receive and store certificate messages
@@ -568,6 +580,37 @@ async fn process_ready_blocks(
         let pair = pending.remove(&k).expect("exists");
         let block_info = pair.bi.clone();
 
+        let on_epoch_transition = block_info.new_epoch && block_info.epoch > 0;
+        match (
+            pair.certs.is_some(),
+            pair.gov.is_some(),
+            on_epoch_transition,
+        ) {
+            (true, false, false) => info!(
+                "Processing cert only for block #{} epoch {}",
+                block_info.number, block_info.epoch
+            ),
+            (true, true, false) => info!(
+                "Processing cert and gov for block #{} epoch {}",
+                block_info.number, block_info.epoch
+            ),
+            (true, false, true) => info!(
+                "Processing cert on epoch transition at block #{} epoch {}",
+                block_info.number, block_info.epoch
+            ),
+            (true, true, true) => info!(
+                "Processing cert and gov on epoch transition at block #{} epoch {}",
+                block_info.number, block_info.epoch
+            ),
+            _ => warn!(
+                "Unexpected processing state for block #{} epoch {} (certs: {}, gov: {})",
+                block_info.number,
+                block_info.epoch,
+                pair.certs.is_some(),
+                pair.gov.is_some()
+            ),
+        }
+
         // Get the current state or initialize with config
         let mut state = {
             let mut h = history_handler.lock().await;
@@ -577,37 +620,99 @@ async fn process_ready_blocks(
         // Check if we are at an epoch boundary
         let new_epoch = block_info.new_epoch && block_info.epoch > 0;
         if new_epoch {
+            let verbose_logging = conway_epoch_start.is_some();
+
+            if verbose_logging {
+                info!(
+                    "[Conway] Epoch boundary at epoch {} (block #{})",
+                    block_info.epoch, block_info.number
+                );
+            }
+
+            if verbose_logging {
+                info!(
+                    "[Conway] Epoch boundary at epoch {} (block #{})",
+                    block_info.epoch, block_info.number
+                );
+                // Debug pending map
+                let pending_summary: Vec<_> = pending
+                    .iter()
+                    .map(|(bn, p)| {
+                        format!(
+                            "block={} certs={} gov={}",
+                            bn,
+                            p.certs.is_some(),
+                            p.gov.is_some()
+                        )
+                    })
+                    .collect();
+                info!(
+                    "[Conway] Pending after epoch transition: {:?}",
+                    pending_summary
+                );
+            }
+
             // At epoch boundary, read parameters to check for Conway activation and retrieve
             // DRep expiration parameter.
             if let Some(sub) = parameters_subscription.as_mut() {
-                if let Ok(Ok((pblk, d_rep_activity))) =
-                    timeout(Duration::from_millis(50), read_parameters(sub)).await
-                {
-                    // Set conway_block_start if epoch transition to Conway is detected
-                    if conway_epoch_start.is_none() {
-                        *conway_epoch_start = Some(block_info.epoch);
-                        info!("Conway activated at epoch {}", block_info.epoch);
-                    }
+                loop {
+                    match read_parameters(sub).await {
+                        Ok((pblk, d_rep_activity)) => {
+                            if verbose_logging {
+                                info!(
+                                    "[Conway] Got parameters for epoch {} block #{}, d_rep_activity = {}",
+                                    pblk.epoch, pblk.number, d_rep_activity
+                                );
+                            }
 
-                    // Ensure parameters are for the correct block
-                    if pblk.number != block_info.number {
-                        error!(
-                            "Params out of sync: certs {} vs params {}",
-                            block_info.number, pblk.number
-                        );
-                    }
+                            // Skip stale messages from prior epochs
+                            if pblk.epoch < block_info.epoch {
+                                info!(
+                                    "[Conway] Skipping stale parameters from epoch {} (current epoch = {})",
+                                    pblk.epoch, block_info.epoch
+                                );
+                                continue; // read next message
+                            }
 
-                    // Update DRep expirations based on DRep expiration parameter
-                    if let Err(err) =
-                        state.update_drep_expirations(block_info.epoch, d_rep_activity)
-                    {
-                        error!("Failed to update DRep expirations: {err}");
+                            // If we're somehow ahead, break to avoid stalling
+                            if pblk.epoch > block_info.epoch {
+                                warn!(
+                                    "[Conway] Got parameters for future epoch {} (expected {}). Proceeding...",
+                                    pblk.epoch, block_info.epoch
+                                );
+                                break;
+                            }
+
+                            // Detect Conway activation from protocol parameters
+                            if conway_epoch_start.is_none() {
+                                if d_rep_activity > 0 {
+                                    *conway_epoch_start = Some(block_info.epoch);
+                                    info!("[Conway] Activated at epoch {}", block_info.epoch);
+                                } else {
+                                    info!(
+                                        "[Conway] Still inactive at epoch {} (d_rep_activity = {})",
+                                        block_info.epoch, d_rep_activity
+                                    );
+                                    break;
+                                }
+                            }
+
+                            // Update DRep expirations based on DRep expiration parameter
+                            if let Err(err) =
+                                state.update_drep_expirations(block_info.epoch, d_rep_activity)
+                            {
+                                error!("[Conway] Failed to update expirations: {err}");
+                            }
+                            break;
+                        }
+                        Err(err) => {
+                            error!(
+                                "Error reading protocol parameters at epoch {}: {err}",
+                                block_info.epoch
+                            );
+                            continue;
+                        }
                     }
-                } else {
-                    debug!(
-                        "No params at epoch boundary {}, proceeding with previous era",
-                        block_info.epoch
-                    );
                 }
             }
 
@@ -661,7 +766,7 @@ pub async fn read_parameters(
             if let Some(conway) = &params.params.conway {
                 Ok((blk.clone(), conway.d_rep_activity))
             } else {
-                Err(anyhow!("ProtocolParams without Conway section"))
+                Ok((blk.clone(), 0))
             }
         }
         other => Err(anyhow!("Unexpected message on parameters topic: {other:?}")),
