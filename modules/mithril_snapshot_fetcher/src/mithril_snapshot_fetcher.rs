@@ -268,7 +268,7 @@ impl MithrilSnapshotFetcher {
                         // TODO - can we avoid this and still get the slot & number?
                         let block = MultiEraBlock::decode(&raw_block)?;
                         let slot = block.slot();
-                        let number = block.number();
+                        let number = block.header().number();
 
                         if tracing::enabled!(tracing::Level::DEBUG) {
                             debug!(number, slot);

@@ -159,15 +159,7 @@ impl DRepState {
 
                 // If no messages were drained, wait for new messages
                 if !new_messages {
-                    wait_for_new_message(
-                        &mut pending,
-                        &mut rx_certs,
-                        &mut rx_gov,
-                        &init_cfg,
-                        &conway_epoch_start,
-                    )
-                    .await;
-                    continue;
+                    wait_for_new_message(&mut pending, &mut rx_certs, &mut rx_gov, &init_cfg).await;
                 }
 
                 // Process blocks that have both certs and gov messages ready sequentially by block number
@@ -366,17 +358,28 @@ fn spawn_subscription_forwarders(
     tokio::spawn(async move {
         while let Ok((_, msg)) = certs_subscription.read().await {
             if tx_certs.send(msg).is_err() {
-                break;
+                tracing::warn!("certificate forwarder: receiver dropped, exiting");
+                return;
             }
         }
+        tracing::error!("certificate subscription closed, forwarder exiting");
     });
 
     // Governance forwarder
     if let Some(mut sub) = gov_subscription {
         tokio::spawn(async move {
             while let Ok((_, msg)) = sub.read().await {
-                let _ = tx_gov.send(msg);
+                if let Message::Cardano((bi, CardanoMessage::GovernanceProcedures(_))) =
+                    msg.as_ref()
+                {
+                    tracing::info!("governance forwarder: forwarded block {}", bi.number);
+                }
+                if tx_gov.send(msg).is_err() {
+                    tracing::warn!("governance forwarder: receiver dropped, exiting");
+                    return;
+                }
             }
+            tracing::error!("governance subscription closed, forwarder exiting");
         });
     }
 
@@ -396,7 +399,7 @@ async fn drain_cert_messages(
         progressed = true;
         if let Message::Cardano((bi, CardanoMessage::TxCertificates(certs))) = msg.as_ref() {
             // Ensure we don't reprocess blocks
-            if bi.number <= *last_committed {
+            if bi.number < *last_committed {
                 continue;
             }
 
@@ -453,7 +456,7 @@ async fn drain_gov_messages(
         progressed = true;
         if let Message::Cardano((bi, CardanoMessage::GovernanceProcedures(gp))) = msg.as_ref() {
             // Ensure we don't reprocess blocks
-            if bi.number <= *last_committed {
+            if bi.number < *last_committed {
                 continue;
             }
 
@@ -505,50 +508,42 @@ async fn wait_for_new_message(
     rx_certs: &mut mpsc::UnboundedReceiver<Arc<Message>>,
     rx_gov: &mut mpsc::UnboundedReceiver<Arc<Message>>,
     init_cfg: &DRepStorageConfig,
-    conway_epoch_start: &Option<u64>,
 ) {
-    // Only listen for gov messages if store-votes is enabled, Conway era has started,
-    // and there are pending cert messages awaiting their gov partner.
-    let wait_for_gov = init_cfg.store_votes
-        && pending.values().any(|p| {
-            p.certs.is_some()
-                && p.gov.is_none()
-                && conway_epoch_start.map_or(false, |start| p.bi.epoch >= start)
-        });
-
-    if wait_for_gov {
-        info!(
-            "Waiting for governance message for block(s): {:?}",
-            pending
-                .iter()
-                .filter(|(_, p)| p.certs.is_some() && p.gov.is_none())
-                .map(|(bn, _)| *bn)
-                .collect::<Vec<_>>()
-        );
-    } else {
-        info!("Waiting for certificate message");
+    // Advisory logging
+    if let Some((bn, pair)) = pending.iter().next() {
+        let mut missing = Vec::new();
+        if pair.certs.is_none() {
+            missing.push("certificates");
+        }
+        if init_cfg.store_votes && pair.gov.is_none() {
+            missing.push("governance");
+        }
+        if !missing.is_empty() {
+            tracing::info!("waiting for block {} to receive {:?}", bn, missing);
+        }
     }
 
-    // Wait for new messages to avoid busy waiting
     tokio::select! {
-        // Always receive and store certificate messages
         Some(msg) = rx_certs.recv() => {
             if let Message::Cardano((bi, CardanoMessage::TxCertificates(certs))) = msg.as_ref() {
+                tracing::info!("received certs for block {}", bi.number);
                 pending.entry(bi.number)
                     .or_insert_with(|| Pair { bi: bi.clone(), certs: None, gov: None })
                     .certs = Some(certs.clone());
             }
         }
 
-        // Only poll gov when a block is waiting for its gov partner.
-        Some(msg) = rx_gov.recv(), if wait_for_gov => {
+        Some(msg) = rx_gov.recv(), if init_cfg.store_votes => {
             if let Message::Cardano((bi, CardanoMessage::GovernanceProcedures(gp))) = msg.as_ref() {
+                tracing::info!("received gov for block {}", bi.number);
                 pending.entry(bi.number)
                     .or_insert_with(|| Pair { bi: bi.clone(), certs: None, gov: None })
                     .gov = Some(gp.clone());
             }
         }
     }
+
+    // After one message, just return — main loop will call again if needed
 }
 
 async fn process_ready_blocks(
@@ -564,12 +559,8 @@ async fn process_ready_blocks(
 ) {
     // Process blocks that have both certs and gov messages ready sequentially by block number
     while let Some((&k, p)) = pending.iter().next() {
-        // Check if governance certs are needed based on store-votes config and if conway has started.
-        let need_gov =
-            init_cfg.store_votes && conway_epoch_start.map_or(false, |start| p.bi.epoch >= start);
-
-        // Check if both cert and gov messages are ready for this block
-        let ready = p.certs.is_some() && (!need_gov || p.gov.is_some());
+        // Check if all per block message components are ready
+        let ready = p.certs.is_some() && p.gov.is_some();
 
         // If the oldest block is not ready, exit loop
         if !ready {
@@ -580,42 +571,31 @@ async fn process_ready_blocks(
         let pair = pending.remove(&k).expect("exists");
         let block_info = pair.bi.clone();
 
-        let on_epoch_transition = block_info.new_epoch && block_info.epoch > 0;
-        match (
-            pair.certs.is_some(),
-            pair.gov.is_some(),
-            on_epoch_transition,
-        ) {
-            (true, false, false) => info!(
-                "Processing cert only for block #{} epoch {}",
-                block_info.number, block_info.epoch
-            ),
-            (true, true, false) => info!(
-                "Processing cert and gov for block #{} epoch {}",
-                block_info.number, block_info.epoch
-            ),
-            (true, false, true) => info!(
-                "Processing cert on epoch transition at block #{} epoch {}",
-                block_info.number, block_info.epoch
-            ),
-            (true, true, true) => info!(
-                "Processing cert and gov on epoch transition at block #{} epoch {}",
-                block_info.number, block_info.epoch
-            ),
-            _ => warn!(
-                "Unexpected processing state for block #{} epoch {} (certs: {}, gov: {})",
-                block_info.number,
-                block_info.epoch,
-                pair.certs.is_some(),
-                pair.gov.is_some()
-            ),
-        }
-
         // Get the current state or initialize with config
         let mut state = {
             let mut h = history_handler.lock().await;
             h.get_or_init_with(|| State::new(init_cfg.clone()))
         };
+
+        if let Some((next_bn, next_pair)) = pending.iter().next() {
+            let message_type = if next_pair.certs.is_some() && next_pair.gov.is_none() {
+                "governance"
+            } else if next_pair.gov.is_some() && next_pair.certs.is_none() {
+                "certificate"
+            } else {
+                "nothing"
+            };
+
+            info!(
+                "processing block {}. Next block {} awaiting {}",
+                block_info.number, next_bn, message_type
+            );
+        } else {
+            info!(
+                "processing block {}. No next block pending",
+                block_info.number
+            );
+        }
 
         // Check if we are at an epoch boundary
         let new_epoch = block_info.new_epoch && block_info.epoch > 0;
