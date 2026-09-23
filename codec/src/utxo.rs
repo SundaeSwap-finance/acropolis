@@ -1,7 +1,7 @@
 use crate::{utils::to_hash, witness::map_native_script};
 use acropolis_common::*;
 use pallas_primitives::conway;
-use pallas_traverse::{MultiEraPolicyAssets, MultiEraValue};
+use pallas_traverse::{MultiEraPolicyAssets, MultiEraScriptRef, MultiEraValue};
 
 pub fn map_value(pallas_value: &MultiEraValue) -> Value {
     let lovelace = pallas_value.coin();
@@ -63,28 +63,36 @@ pub fn map_value(pallas_value: &MultiEraValue) -> Value {
     Value::new(lovelace, assets)
 }
 
-pub fn map_datum(datum: &Option<conway::MintedDatumOption>) -> Option<Datum> {
+pub fn map_datum(datum: &Option<conway::DatumOption>) -> Option<Datum> {
     match datum {
-        Some(conway::MintedDatumOption::Hash(h)) => Some(Datum::Hash(DatumHash::from(**h))),
-        Some(conway::MintedDatumOption::Data(d)) => Some(Datum::Inline(d.raw_cbor().to_vec())),
+        Some(conway::DatumOption::Hash(h)) => Some(Datum::Hash(DatumHash::from(**h))),
+        Some(conway::DatumOption::Data(d)) => Some(Datum::Inline(d.raw_cbor().to_vec())),
         None => None,
     }
 }
 
-pub fn map_reference_script(script: &Option<conway::MintedScriptRef>) -> Option<ReferenceScript> {
+pub fn map_reference_script(script: &Option<MultiEraScriptRef>) -> Option<ReferenceScript> {
     match script {
-        Some(conway::PseudoScript::NativeScript(script)) => {
-            Some(ReferenceScript::Native(map_native_script(script)))
-        }
-        Some(conway::PseudoScript::PlutusV1Script(script)) => {
-            Some(ReferenceScript::PlutusV1(script.as_ref().to_vec()))
-        }
-        Some(conway::PseudoScript::PlutusV2Script(script)) => {
-            Some(ReferenceScript::PlutusV2(script.as_ref().to_vec()))
-        }
-        Some(conway::PseudoScript::PlutusV3Script(script)) => {
-            Some(ReferenceScript::PlutusV3(script.as_ref().to_vec()))
-        }
+        Some(MultiEraScriptRef::Conway(script_ref)) => match script_ref.as_ref() {
+            conway::ScriptRef::NativeScript(script) => {
+                Some(ReferenceScript::Native(map_native_script(script)))
+            }
+            conway::ScriptRef::PlutusV1Script(script) => {
+                Some(ReferenceScript::PlutusV1(script.as_ref().to_vec()))
+            }
+            conway::ScriptRef::PlutusV2Script(script) => {
+                Some(ReferenceScript::PlutusV2(script.as_ref().to_vec()))
+            }
+            conway::ScriptRef::PlutusV3Script(script) => {
+                Some(ReferenceScript::PlutusV3(script.as_ref().to_vec()))
+            }
+        },
+        // Dijkstra reference scripts (including the new PlutusV4Script) aren't
+        // representable in acropolis_common::ReferenceScript yet — no consumer
+        // in this migration's scope needs them (the deployed sundae-v4
+        // contracts are PlutusV3). Revisit if/when PlutusV4 scripts matter.
+        Some(MultiEraScriptRef::Dijkstra(_)) => None,
+        Some(_) => None,
         None => None,
     }
 }

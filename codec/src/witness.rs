@@ -40,7 +40,11 @@ pub fn map_native_script(script: &alonzo::NativeScript) -> NativeScript {
             NativeScript::ScriptAny(scripts.iter().map(map_native_script).collect())
         }
         alonzo::NativeScript::ScriptNOfK(n, scripts) => {
-            NativeScript::ScriptNOfK(*n, scripts.iter().map(map_native_script).collect())
+            // The ledger CDDL types this threshold as a signed int64; a
+            // negative or overflowing value can't be satisfied by any set of
+            // scripts, so clamp instead of panicking on untrusted chain data.
+            let n = (*n).try_into().unwrap_or(u32::MAX);
+            NativeScript::ScriptNOfK(n, scripts.iter().map(map_native_script).collect())
         }
         alonzo::NativeScript::InvalidBefore(slot_no) => NativeScript::InvalidBefore(*slot_no),
         alonzo::NativeScript::InvalidHereafter(slot_no) => NativeScript::InvalidHereafter(*slot_no),

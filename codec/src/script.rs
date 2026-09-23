@@ -1,17 +1,20 @@
 use acropolis_common::{ExUnits, Redeemer, RedeemerTag};
 use anyhow::{Result, anyhow};
 use pallas::codec::minicbor;
-use pallas_primitives::{ExUnits as PallasExUnits, conway};
-use pallas_traverse::MultiEraRedeemer;
+use pallas_primitives::ExUnits as PallasExUnits;
+use pallas_traverse::{MultiEraRedeemer, MultiEraRedeemerTag};
 
-fn map_redeemer_tag(tag: &conway::RedeemerTag) -> RedeemerTag {
+fn map_redeemer_tag(tag: &MultiEraRedeemerTag) -> Result<RedeemerTag> {
     match tag {
-        conway::RedeemerTag::Spend => RedeemerTag::Spend,
-        conway::RedeemerTag::Mint => RedeemerTag::Mint,
-        conway::RedeemerTag::Cert => RedeemerTag::Cert,
-        conway::RedeemerTag::Reward => RedeemerTag::Reward,
-        conway::RedeemerTag::Vote => RedeemerTag::Vote,
-        conway::RedeemerTag::Propose => RedeemerTag::Propose,
+        MultiEraRedeemerTag::Spend => Ok(RedeemerTag::Spend),
+        MultiEraRedeemerTag::Mint => Ok(RedeemerTag::Mint),
+        MultiEraRedeemerTag::Cert => Ok(RedeemerTag::Cert),
+        MultiEraRedeemerTag::Reward => Ok(RedeemerTag::Reward),
+        MultiEraRedeemerTag::Vote => Ok(RedeemerTag::Vote),
+        MultiEraRedeemerTag::Propose => Ok(RedeemerTag::Propose),
+        // Dijkstra's new "Guarding" purpose (and any future tag) has no
+        // acropolis_common::RedeemerTag counterpart yet.
+        _ => Err(anyhow!("Unsupported redeemer tag: {tag:?}")),
     }
 }
 
@@ -32,7 +35,7 @@ pub fn map_redeemer(redeemer: &MultiEraRedeemer) -> Result<Redeemer> {
         .map_err(|_| anyhow!("Failed to encode plutus data of redeemer index {}", index))?;
 
     Ok(Redeemer {
-        tag: map_redeemer_tag(&tag),
+        tag: map_redeemer_tag(&tag)?,
         index,
         data: raw_plutus_data,
         ex_units: map_ex_units(&ex_units),

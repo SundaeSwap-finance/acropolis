@@ -2,7 +2,7 @@ use crate::{
     address::map_address, certs::map_certificate, map_all_governance_voting_procedures,
     map_alonzo_update, map_babbage_update, map_datum, map_governance_proposals_procedure,
     map_mint_burn, map_native_script, map_redeemer, map_reference_script, map_value,
-    witness::map_vkey_witnesses,
+    utils::to_hash, witness::map_vkey_witnesses,
 };
 use acropolis_common::{validation::Phase1ValidationError, *};
 use pallas_primitives::Metadatum as PallasMetadatum;
@@ -156,9 +156,15 @@ pub fn map_scripts_witnesses(tx: &MultiEraTx) -> Vec<(ScriptHash, ReferenceScrip
     let mut scripts_provided = Vec::new();
 
     for script in tx.native_scripts() {
+        // Dijkstra native scripts (which may use the new RequireGuard clause)
+        // have no acropolis_common::NativeScript representation yet — no
+        // consumer in this migration's scope needs them.
+        let Some(alonzo_script) = script.as_alonzo_compatible() else {
+            continue;
+        };
         scripts_provided.push((
-            ScriptHash::from(*script.original_hash()),
-            ReferenceScript::Native(map_native_script(script)),
+            to_hash(&script.hash()),
+            ReferenceScript::Native(map_native_script(alonzo_script)),
         ));
     }
 
