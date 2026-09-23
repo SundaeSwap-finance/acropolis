@@ -140,8 +140,11 @@ impl TryFrom<u8> for Era {
             3 => Ok(Era::Mary),
             4 => Ok(Era::Alonzo),
             5 => Ok(Era::Babbage),
-            6 => Ok(Era::Conway),
-            n => bail!("Impossible era {n}"),
+            // LOCAL WORKAROUND (not upstream): Musashi/Dijkstra reports era 7,
+            // which this enum has no variant for. Treat any post-Conway era as
+            // Conway so header/UTxO decoding keeps working — scooper-v2 only
+            // needs to follow the chain, not run era-specific ledger rules.
+            6.. => Ok(Era::Conway),
         }
     }
 }
