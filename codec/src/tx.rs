@@ -77,7 +77,7 @@ pub fn map_transaction_consumes_produces(
         match output.address() {
             Ok(pallas_address) => match map_address(&pallas_address) {
                 Ok(address) => {
-                    let reference_script = map_reference_script(&output.script_ref());
+                    let reference_script = map_reference_script(&output.multi_era_script_ref());
                     let script_ref = reference_script.as_ref().map(|s| s.get_script_ref());
 
                     if let (Some(r_script), Some(s_ref)) =
@@ -155,7 +155,7 @@ pub fn map_metadata(metadata: &MultiEraMeta) -> Option<Metadata> {
 pub fn map_scripts_witnesses(tx: &MultiEraTx) -> Vec<(ScriptHash, ReferenceScript)> {
     let mut scripts_provided = Vec::new();
 
-    for script in tx.native_scripts() {
+    for script in tx.multi_era_native_scripts() {
         // Dijkstra native scripts (which may use the new RequireGuard clause)
         // have no acropolis_common::NativeScript representation yet — no
         // consumer in this migration's scope needs them.

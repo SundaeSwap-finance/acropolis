@@ -26,7 +26,7 @@ fn map_ex_units(ex_units: &PallasExUnits) -> ExUnits {
 }
 
 pub fn map_redeemer(redeemer: &MultiEraRedeemer) -> Result<Redeemer> {
-    let tag = redeemer.tag();
+    let tag = redeemer.multi_era_tag();
     let index = redeemer.index();
     let plutus_data = redeemer.data();
     let ex_units = redeemer.ex_units();
