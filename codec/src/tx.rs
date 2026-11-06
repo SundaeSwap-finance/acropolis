@@ -116,6 +116,8 @@ pub fn map_transaction_consumes_produces(
 pub fn map_transaction_donation(tx: &MultiEraTx) -> Option<u64> {
     match tx {
         MultiEraTx::Conway(conway) => conway.transaction_body.donation.map(u64::from),
+        MultiEraTx::Dijkstra(tx) => tx.transaction_body.donation.map(u64::from),
+        MultiEraTx::DijkstraSub(tx, _) => tx.sub_transaction_body.donation.map(u64::from),
         _ => None,
     }
 }
@@ -123,6 +125,8 @@ pub fn map_transaction_donation(tx: &MultiEraTx) -> Option<u64> {
 pub fn map_transaction_treasury_value(tx: &MultiEraTx) -> Option<u64> {
     match tx {
         MultiEraTx::Conway(conway) => conway.transaction_body.treasury_value,
+        MultiEraTx::Dijkstra(tx) => tx.transaction_body.treasury_value,
+        MultiEraTx::DijkstraSub(tx, _) => tx.sub_transaction_body.treasury_value,
         _ => None,
     }
 }
